@@ -1,0 +1,42 @@
+# Environnement
+.env
+.venv/
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Données — ne pas versionner les fichiers volumineux
+data/raw/
+data/processed/
+data/external/
+*.tif
+*.tiff
+*.jp2
+*.nc
+
+# Garder les .gitkeep
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+!data/external/.gitkeep
+
+# Notebooks — outputs
+notebooks/.ipynb_checkpoints/
+
+# Rapports générés
+*.pdf
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Poetry
+dist/
+*.egg-info/
