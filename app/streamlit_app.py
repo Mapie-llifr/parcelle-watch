@@ -1,14 +1,13 @@
 """
 app/streamlit_app.py
 --------------------
-Interface utilisateur principale de Parcelle Watch.
+Point d'entree de l'application Parcelle Watch.
+Streamlit multi-pages : chaque fichier dans app/pages/ est une page.
 
-Navigation :
-    📡 Mes Parcelles   — sélection et visualisation des parcelles (RPG ou dessin manuel)
-    🌿 Indices         — cartes NDVI/NDRE/NDWI interactives + série temporelle
-    🚨 Alertes         — anomalies détectées, sévérité, localisation
-    📈 Rendement       — prévision de rendement avec intervalles de confiance
-    📄 Rapport         — génération et téléchargement du rapport PDF hebdo
+Pages disponibles :
+  1_Mes_Parcelles.py  -> selection des parcelles sur carte
+  2_Alertes.py        -> carte des alertes + tableau
+  3_Rapport_PDF.py    -> generation et telechargement PDF
 
 Lancement :
     poetry run streamlit run app/streamlit_app.py
@@ -16,7 +15,6 @@ Lancement :
 
 import streamlit as st
 
-# ── Configuration de la page ──────────────────────────────────────────────────
 st.set_page_config(
     page_title="Parcelle Watch",
     page_icon="🛰️",
@@ -24,69 +22,35 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# ── Sidebar ───────────────────────────────────────────────────────────────────
-with st.sidebar:
-    st.image("docs/logo.png", width=180) if False else st.title("🛰️ Parcelle Watch")
-    st.caption("Surveillance satellite de vos parcelles")
-    st.divider()
+st.title("🛰️ Parcelle Watch")
+st.markdown(
+    "Surveillance satellite des parcelles agricoles — "
+    "detection precoce de stress hydrique, risque ravageurs, prevision de rendement."
+)
+st.divider()
 
-    page = st.radio(
-        "Navigation",
-        options=[
-            "📡 Mes Parcelles",
-            "🌿 Indices & Végétation",
-            "🚨 Alertes",
-            "📈 Prévision Rendement",
-            "📄 Rapport PDF",
-        ],
-        label_visibility="collapsed",
-    )
+col1, col2, col3 = st.columns(3)
 
-    st.divider()
-    st.caption("Données : Sentinel-2 · Open-Meteo · RPG")
+with col1:
+    st.markdown("### 🗺️ Mes Parcelles")
+    st.markdown("Selectionnez vos parcelles agricoles sur la carte interactive.")
+    if st.button("Acceder", key="btn_parcelles", use_container_width=True):
+        st.switch_page("pages/1_Mes_Parcelles.py")
 
-# ── Pages ─────────────────────────────────────────────────────────────────────
+with col2:
+    st.markdown("### 🚨 Alertes")
+    st.markdown("Visualisez les alertes de stress hydrique par parcelle et par date.")
+    if st.button("Acceder", key="btn_alertes", use_container_width=True):
+        st.switch_page("pages/2_Alertes.py")
 
-if page == "📡 Mes Parcelles":
-    st.header("📡 Mes Parcelles")
-    st.info("🚧 En construction — Étape 1 : sélection de parcelle via RPG ou coordonnées GPS")
-    # TODO:
-    # - Carte Folium pour sélectionner / dessiner une parcelle
-    # - Chargement depuis RPG (GeoJSON)
-    # - Saisie manuelle de coordonnées
-    # - Lancement du téléchargement Sentinel-2
+with col3:
+    st.markdown("### 📄 Rapport PDF")
+    st.markdown("Generez et telechargez le rapport hebdomadaire de vos parcelles.")
+    if st.button("Acceder", key="btn_rapport", use_container_width=True):
+        st.switch_page("pages/3_Rapport_PDF.py")
 
-elif page == "🌿 Indices & Végétation":
-    st.header("🌿 Indices de Végétation")
-    st.info("🚧 En construction — Étape 2 : cartes NDVI + séries temporelles")
-    # TODO:
-    # - Sélecteur d'indice (NDVI / NDRE / NDWI / EVI)
-    # - Carte Folium colorée par valeur d'indice
-    # - Graphique temporel Plotly (évolution sur la saison)
-    # - Comparaison avec saison précédente
-
-elif page == "🚨 Alertes":
-    st.header("🚨 Alertes Détectées")
-    st.info("🚧 En construction — Étape 2 : détection d'anomalies Isolation Forest")
-    # TODO:
-    # - Tableau des alertes récentes (date, zone, sévérité, indice concerné)
-    # - Carte des zones en anomalie
-    # - Graphique : score d'anomalie dans le temps
-
-elif page == "📈 Prévision Rendement":
-    st.header("📈 Prévision de Rendement")
-    st.info("🚧 En construction — Étape 4 : prédiction XGBoost")
-    # TODO:
-    # - Sélecteur culture + département
-    # - Affichage prédiction centrale + intervalle de confiance
-    # - Graphique comparaison avec moyenne régionale Agreste
-    # - Importance des features
-
-elif page == "📄 Rapport PDF":
-    st.header("📄 Rapport Hebdomadaire")
-    st.info("🚧 En construction — Étape 3 : génération PDF automatique")
-    # TODO:
-    # - Bouton "Générer le rapport"
-    # - Aperçu des sections incluses
-    # - Bouton de téléchargement
-    # - Option d'envoi par email (futur)
+st.divider()
+st.caption(
+    "Donnees : Sentinel-2 (ESA/Copernicus) · Open-Meteo · "
+    "Registre Parcellaire Graphique (IGN) · Modele Isolation Forest"
+)

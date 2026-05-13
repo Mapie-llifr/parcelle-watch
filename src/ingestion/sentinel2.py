@@ -68,6 +68,29 @@ function evaluatePixel(sample) {
 }
 """
 
+# __ Variation pour vision en couleurs réelles __________________________________
+
+# Evalscript exceptionnel — 7 bandes FLOAT32
+EVALSCRIPT_7BANDS = """
+//VERSION=3
+function setup() {
+    return {
+        input: ["B02", "B03", "B04", "B05", "B08", "B8A", "B11"],
+        output: { bands: 7, sampleType: "FLOAT32" }
+    };
+}
+function evaluatePixel(sample) {
+    return [
+        sample.B04,   // bande 1 — Rouge    → NDVI, EVI
+        sample.B03,   // bande 2 — Vert     → NDWI, EVI  
+        sample.B02,   // bande 3 — Bleu     → RGB visible
+        sample.B05,   // bande 4 — Red Edge → NDRE
+        sample.B08,   // bande 5 — PIR large → NDVI, NDRE, EVI
+        sample.B8A,   // bande 6 — PIR étroit → NDRE
+        sample.B11,   // bande 7 — SWIR     → NDWI
+    ];
+}
+"""
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 
@@ -212,7 +235,7 @@ def download_scene(
     config: SHConfig | None = None,
 ) -> Path:
     """
-    Télécharge les 6 bandes d'intérêt pour une date et une zone données.
+    Télécharge les 7 bandes d'intérêt pour une date et une zone données.
 
     Args:
         bbox: Emprise géographique
@@ -243,7 +266,7 @@ def download_scene(
     )
 
     request = SentinelHubRequest(
-        evalscript=EVALSCRIPT_6BANDS,
+        evalscript=EVALSCRIPT_7BANDS,
         input_data=[
             SentinelHubRequest.input_data(
                 data_collection=DataCollection.SENTINEL2_L1C.define_from(

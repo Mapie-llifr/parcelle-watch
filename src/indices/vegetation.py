@@ -36,16 +36,18 @@ def load_bands(tif_path: Path) -> dict[str, np.ndarray]:
 
     Convention d'ordre des bandes dans le fichier (défini dans sentinel2.py) :
         0: B04 (Rouge)
-        1: B05 (Red Edge)
-        2: B08 (PIR)
-        3: B8A (PIR étroit)
-        4: B11 (SWIR)
-        5: B03 (Vert)
+        1: B03 (Vert)
+        2: B02 (Bleu)
+        3: B05 (Red Edge)
+        4: B08 (PIR)
+        5: B8A (PIR étroit)
+        6: B11 (SWIR)
+        
 
     Returns:
-        Dict {'B04': array, 'B05': array, ...} avec valeurs float [0, 1]
+        Dict {'B04': array, 'B03': array, ...} avec valeurs float [0, 1]
     """
-    band_names = ["B04", "B05", "B08", "B8A", "B11", "B03"]
+    band_names = ["B04", "B03", "B02", "B05", "B08", "B8A", "B11"]
 
     with rasterio.open(tif_path) as src:
         bands = {}
