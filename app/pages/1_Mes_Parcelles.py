@@ -438,10 +438,13 @@ with tab_clic:
                     culture = parcelle_row.get("code_cultu", "?")
                     label   = CODE_CULTU_LABELS.get(culture, culture)
                     surf    = parcelle_row.get("surf_parc", 0)
+                    geom    = parcelle_row.get("geometry", [])
+                    min_lon, min_lat, max_lon, max_lat = geom.bounds
                     st.session_state["parcelles"][pid] = {
                         "source"           : "rpg",
                         "code_cultu"       : culture,
                         "surf_parc"        : surf,
+                        "bbox"             : (min_lon, min_lat, max_lon, max_lat),
                         "geometry_geojson" : parcelle_row.geometry.__geo_interface__,
                         "lat"              : click_lat,
                         "lon"              : click_lon,
@@ -517,11 +520,13 @@ with tab_dessin:
             try:
                 poly     = shape(drawing["geometry"])
                 centroid = poly.centroid
+                min_lon, min_lat, max_lon, max_lat = poly.bounds
                 st.session_state["parcelles"][pid] = {
                     "source"           : "dessin",
                     "nom"              : nom_dessin.strip(),
                     "code_cultu"       : culture_dessin,
                     "surf_parc"        : surf_dessin,
+                    "bbox"             : (min_lon, min_lat, max_lon, max_lat),
                     "geometry_geojson" : drawing["geometry"],
                     "lat"              : centroid.y,
                     "lon"              : centroid.x,
@@ -580,11 +585,13 @@ with tab_gps:
                       key="btn_add_gps"):
             pid      = f"gps_{uuid.uuid4().hex[:8]}"
             centroid = poly_gps.centroid
+            min_lon, min_lat, max_lon, max_lat = poly_gps.bounds
             st.session_state["parcelles"][pid] = {
                 "source"           : "gps",
                 "nom"              : nom_gps.strip(),
                 "code_cultu"       : culture_gps,
                 "surf_parc"        : surf_gps,
+                "bbox"             : (min_lon, min_lat, max_lon, max_lat),
                 "geometry_geojson" : poly_gps.__geo_interface__,
                 "lat"              : centroid.y,
                 "lon"              : centroid.x,
