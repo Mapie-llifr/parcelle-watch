@@ -14,6 +14,7 @@ Lancement :
 """
 
 import streamlit as st
+from datetime import date
 
 st.set_page_config(
     page_title="Parcelle Watch",
@@ -22,12 +23,16 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+if "today" not in st.session_state:
+    st.session_state["today"] = date.today()
+
 st.title("🛰️ Parcelle Watch")
 st.markdown(
     "Surveillance satellite des parcelles agricoles — "
     "detection precoce de stress hydrique, risque ravageurs, prevision de rendement."
 )
 st.divider()
+st.markdown(f"Aujourd'hui, nous sommes le {st.session_state['today'].day}/{st.session_state['today'].month}/{st.session_state['today'].year}")
 
 col1, col2, col3 = st.columns(3)
 
