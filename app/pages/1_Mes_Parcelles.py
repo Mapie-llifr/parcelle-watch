@@ -445,7 +445,8 @@ with tab_clic:
                         "code_cultu"       : culture,
                         "surf_parc"        : surf,
                         "bbox"             : (min_lon, min_lat, max_lon, max_lat),
-                        "geometry_geojson" : parcelle_row.geometry.__geo_interface__,
+                        #"geometry_geojson" : parcelle_row.geometry.__geo_interface__,
+                        "geometry"         : geom,
                         "lat"              : click_lat,
                         "lon"              : click_lon,
                     }
@@ -527,7 +528,8 @@ with tab_dessin:
                     "code_cultu"       : culture_dessin,
                     "surf_parc"        : surf_dessin,
                     "bbox"             : (min_lon, min_lat, max_lon, max_lat),
-                    "geometry_geojson" : drawing["geometry"],
+                    #"geometry_geojson" : drawing["geometry"],
+                    "geometry"         : poly,
                     "lat"              : centroid.y,
                     "lon"              : centroid.x,
                 }
@@ -592,7 +594,8 @@ with tab_gps:
                 "code_cultu"       : culture_gps,
                 "surf_parc"        : surf_gps,
                 "bbox"             : (min_lon, min_lat, max_lon, max_lat),
-                "geometry_geojson" : poly_gps.__geo_interface__,
+                #"geometry_geojson" : poly_gps.__geo_interface__,
+                "geometry"         : poly_gps,
                 "lat"              : centroid.y,
                 "lon"              : centroid.x,
             }
