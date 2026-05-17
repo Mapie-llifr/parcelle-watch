@@ -12,25 +12,32 @@ from datetime import date, timedelta
 
 import folium
 import geopandas as gpd
+import rasterio
+import rasterio.features
 import joblib
 import numpy as np
 import pandas as pd
 import streamlit as st
 from streamlit_folium import st_folium
 from sentinelhub import BBox, CRS
+from shapely.geometry import Point, Polygon, box, shape, mapping
 
 from src.ingestion.sentinel2 import get_sh_config, search_available_scenes, download_scene
 from src.ingestion.meteo import fetch_historical_weather
 from src.indices.vegetation import compute_ndvi, compute_ndwi, load_bands
 
+#On retire un .parent pour tester si ça suffit pour faire redescendre 
+#la création du fichier data dans la hierarchie.
+#sys.path.insert(0, str(Path(__file__).parent.parent))#.parent)) 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 st.set_page_config(page_title="Alertes - Parcelle Watch", page_icon="🚨", layout="wide")
 
-#ROOT          = Path(__file__).parent.parent.parent
-#DATA_PROC     = ROOT / "data" / "processed"
-DATA_RAW   = Path('../data/raw')
-DATA_PROC  = Path('../data/processed')
+ROOT          = Path(__file__).parent.parent.parent
+DATA_PROC     = ROOT / "data" / "processed"
+DATA_RAW      = ROOT / "data" / "raw"
+#DATA_RAW   = Path('../data/raw')
+#DATA_PROC  = Path('../data/processed')
 MODELS_DIR = DATA_PROC / 'models'
 BBOX_LIMIT    = 800
 #ANOMALIES_CSV = DATA_PROC / "anomalies_brie.csv"
@@ -237,7 +244,7 @@ else:
 
 
 
-# Parcelles selectionnees en session (depuis page Mes Parcelles)
+# Parcelles sélectionnees en session (depuis page Mes Parcelles)
 parcelles_session = st.session_state.get("parcelles", {})
 
 ##########
@@ -245,8 +252,185 @@ parcelles_session = st.session_state.get("parcelles", {})
 # Sauf que ça a crée un fichier data à coté du fichier parent, oups :/
 
 ##########
+
+#Elaboration du Dataframe de features, une ligne par parcelle sélectionnée
+if st.session_state['tif_path'] is None:
+    st.warning('Pas de TIF disponible — Erreur de chargement de la prise de vue satellite.')
+else:
+    # Charger le raster
+    bands, meta = load_bands(st.session_state['tif_path'])
+    ndvi_arr    = compute_ndvi(bands)
+    ndwi_arr    = compute_ndwi(bands)
+    transform   = meta['transform']
+
+    # Features météo (une seule date d'acquisition)
+    meteo_feat = compute_meteo_features(st.session_state['meteo_df'], st.session_state['date_acq'])
+
+    # Pour chaque parcelle
+    rows = []
+    for pid in st.session_state['parcelles'].keys():
+        #geom = st.session_state['parcelles'][pid]['geometry_geojson']
+        geom = st.session_state['parcelles'][pid]['geometry']
+        s_ndvi = zonal_stats_parcel(geom, ndvi_arr, transform)
+        st.markdown(s_ndvi)
+        s_ndwi = zonal_stats_parcel(geom, ndwi_arr, transform)
+        st.markdown(s_ndwi)
+
+        if s_ndvi is None or s_ndwi is None:
+            st.warning(f"⚠️  Parcelle {pid} : trop peu de pixels valides")
+            continue
+
+        row = {
+            'parcelle_id'  : pid,
+            'source'       : st.session_state['parcelles'][pid]['source'],
+            'code_cultu'   : st.session_state['parcelles'][pid]['code_cultu'],
+            'surf_parc'    : st.session_state['parcelles'][pid]['surf_parc'],
+            'date'         : st.session_state['date_acq'],
+            'ndvi_mean'    : s_ndvi['mean'],
+            'ndvi_std'     : s_ndvi['std'],
+            'ndvi_p10'     : s_ndvi['p10'],
+            'ndvi_p90'     : s_ndvi['p90'],
+            'ndwi_mean'    : s_ndwi['mean'],
+            'ndwi_std'     : s_ndwi['std'],
+            'ndwi_p10'     : s_ndwi['p10'],
+            'ndwi_p90'     : s_ndwi['p90'],
+            'n_pixels'     : s_ndvi['n'],
+            'day_of_year'  : st.session_state['date_acq'].timetuple().tm_yday,
+        }
+        row.update(meteo_feat)
+
+        # Features temporelles : pas d'historique ici (une seule date)
+        # On met NaN — le modèle doit gérer l'absence de delta
+        row['ndwi_delta']     = np.nan
+        row['ndvi_delta']     = np.nan
+        row['ndwi_deviation'] = np.nan   # calculé ci-dessous
+        row['ndvi_deviation'] = np.nan
+        rows.append(row)
+
+    df_feat = pd.DataFrame(rows)
+
+    # Déviation par rapport à la médiane de la même culture dans le dataset
+    # Charger les références depuis le dataset d'entraînement
+    # (utilise la moyenne des modèles comme proxy si pas d'historique)
+    # Note : en production charger les refs depuis le CSV d'entraînement
+    df_feat['ndwi_deviation'] = 0.0   # neutre si pas de référence
+    df_feat['ndvi_deviation'] = 0.0
+
+    st.session_state['df_features'] = df_feat
+    st.markdown('\n✅ ÉTAPE 4 OK')
+    st.markdown(df_feat[['parcelle_id','code_cultu','ndvi_mean','ndwi_mean',
+                   'deficit_7d','n_pixels']].to_string())
+
+
+
+
+###############
+## On arrive jusqu'ici ok !!
+# En vrai on va même jusqu'à l'affichage de toutes les colonnes de filtrage
+#################
+
+FEATURE_COLS = [
+    'ndwi_mean','ndwi_p10','ndwi_std','ndvi_mean',
+    'ndwi_deviation','ndvi_deviation',
+    'ndwi_delta','ndvi_delta',
+    'day_of_year',
+    'precip_14d','tmax_7d','deficit_7d',
+]
+
+
+def get_model(code_cultu, stress_type='HYDRIQUE'):
+    """Charge le modèle le plus adapté (spécifique > général)."""
+    index_path = MODELS_DIR / 'models_index.csv'
+    st.markdown(f'index_path: {index_path}')
+    if not index_path.exists():
+        raise FileNotFoundError('models_index.csv manquant. Télécharger les modèles.')
+
+    index = pd.read_csv(index_path)
+    index = index[index['stress_type'] == stress_type]
+
+    for _, row in index.iterrows():
+        codes = str(row['cultures_codes']).split(',')
+        if code_cultu in codes:
+            data = joblib.load(Path(row['path']))
+            data['model_name'] = row['model_name']
+            data['source']     = 'specific'
+            return data
+
+    # Fallback
+    general = index[index['cultures_codes'] == 'ALL']
+    if not general.empty:
+        data = joblib.load(Path(general.iloc[0]['path']))
+        data['source'] = 'fallback'
+        return data
+
+    raise FileNotFoundError(f'Aucun modèle {stress_type} pour {code_cultu}')
+
+
+def score_row(row, feature_cols):
+    """Score une ligne de features avec le modèle approprié."""
+    try:
+        model_data = get_model(row['code_cultu'])
+    except FileNotFoundError as e:
+        st.warning(f"⚠️  {row['parcelle_id']} : {e}")
+        return np.nan, False, 'unknown', 'N/A'
+
+    model  = model_data['model']
+    scaler = model_data['scaler']
+    feats  = model_data.get('features', feature_cols)
+
+    X = row[feats].values.reshape(1, -1)
+    # Remplacer les NaN par 0 (neutre) pour les features temporelles manquantes
+    X = np.nan_to_num(X, nan=0.0)
+    X_sc = scaler.transform(X)
+
+    score  = float(model.decision_function(X_sc)[0])
+    is_anom = bool(model.predict(X_sc)[0] == -1)
+
+    if score < -0.12:  sev = 'critical'
+    elif score < -0.04: sev = 'warning'
+    else:               sev = 'normal'
+
+    return score, is_anom, sev, model_data.get('model_name','general')
+
+
+if st.session_state['df_features'] is None:
+    st.warning('df_features absent — Erreur dans le calcul des features.')
+else:
+    df = st.session_state['df_features'].copy()
+    results = []
+    for _, row in df.iterrows():
+        score, is_anom, sev, model_name = score_row(row, FEATURE_COLS)
+        results.append({
+            'parcelle_id'   : row['parcelle_id'],
+            'code_cultu'    : row['code_cultu'],
+            'surf_parc'     : row['surf_parc'],
+            'ndwi_mean'     : row['ndwi_mean'],
+            'ndvi_mean'     : row['ndvi_mean'],
+            'deficit_7d'    : row['deficit_7d'],
+            'anomaly_score' : score,
+            'is_anomaly'    : is_anom,
+            'severity'      : sev,
+            'model_used'    : model_name,
+        })
+
+    df_res = pd.DataFrame(results)
+    st.session_state['df_results'] = df_res
+
+    st.markdown('\n✅ ÉTAPE 5 OK — Résultats d\'inférence :')
+    st.markdown(df_res[['parcelle_id','code_cultu','ndwi_mean',
+                  'anomaly_score','severity','model_used']].to_string())
+
+
+#########
+# Alors oui, on arrive jusque là, mais ils ne trouvent pas les modèles, on a cette erreur : 
+# ⚠️ 11378520 : [Errno 2] No such file or directory: '../data/processed/models/isolation_forest_HYDRIQUE_MIS.joblib'
+#la suite au prochain épisode.
+##########
+
+
+
 # Selecteurs
-dates_dispo = sorted(df["date"].unique())
+dates_dispo = sorted(st.session_state['df_features']["date"].unique())
 col1, col2, col3 = st.columns([2, 2, 1])
 
 with col1:
@@ -255,13 +439,14 @@ with col1:
         format_func=lambda d: pd.Timestamp(d).strftime("%d %B %Y"),
     )
 with col2:
-    cultures = sorted(df["code_cultu"].dropna().unique())
+    cultures = sorted(st.session_state['df_features']["code_cultu"].dropna().unique())
     sel_cultures = st.multiselect("Cultures", options=cultures, default=cultures)
 with col3:
     sev_filter = st.selectbox("Severite", ["Toutes", "Warning+", "Critique"])
 
+df_feat = st.session_state['df_features']
 # Filtre
-df_date = df[df["date"] == selected_date].copy()
+df_date = df_feat[df_feat["date"] == selected_date].copy()
 if sel_cultures:
     df_date = df_date[df_date["code_cultu"].isin(sel_cultures)]
 if sev_filter == "Warning+":
