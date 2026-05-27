@@ -1,23 +1,3 @@
-"""
-app/pages/1_Mes_Parcelles.py
-----------------------------
-Page de selection et gestion des parcelles surveillees.
-
-Trois modes de selection :
-  1. Clic sur une parcelle RPG existante
-  2. Dessin libre sur la carte (polygone ou rectangle via folium Draw)
-  3. Saisie manuelle de coordonnees GPS
-
-Optimisations :
-  - sindex (R-tree) pour la recherche spatiale au clic
-  - cache TTL=300s sur le WFS RPG
-  - map_key dynamique pour forcer le re-rendu apres selection
-  - "interactive": False sur les GeoJson pour eviter le vol de clic
-
-Session state :
-  st.session_state["parcelles"] : dict {id -> metadata}
-"""
-
 import sys
 import uuid
 import math
@@ -55,15 +35,17 @@ CODE_CULTU_LABELS = {
 }
 
 if "parcelles"  not in st.session_state:
-    st.session_state["parcelles"]  = {} #liste de dict
+    st.session_state["parcelles"]  = {}
 if "map_center" not in st.session_state:
     st.session_state["map_center"] = [DEFAULT_LAT, DEFAULT_LON]
 if "map_zoom"   not in st.session_state:
     st.session_state["map_zoom"]   = DEFAULT_ZOOM
+# ID de la parcelle en cours d'édition (None = aucune)
+if "editing_pid" not in st.session_state:
+    st.session_state["editing_pid"] = None
 
 
 @st.cache_data(ttl=300)
-
 def geocode_address(query):
     try:
         resp = requests.get(
@@ -93,53 +75,40 @@ def parse_gps(text):
 
 
 def check_rpg_availability(rpg_year, today):
-    """
-    Vérifie si on a des données satellite pour une année RPG donnée.
-    Le RPG N est disponible en données ouvertes environ en juin N+1.
-    Les données satellite sont disponibles dès l'année N.
-    """
-    current_year = today.year
+    current_year  = today.year
     current_month = today.month
-
     if rpg_year < 2021:
-        return False, 'RPG disponible uniquement depuis 2021 via WFS IGN'
+        return False, "RPG disponible uniquement depuis 2021 via WFS IGN"
     if rpg_year > current_year:
-        return False, f'RPG {rpg_year} pas encore disponible'
+        return False, f"RPG {rpg_year} pas encore disponible"
     if rpg_year == current_year and current_month < 6:
-        return True, f'RPG {rpg_year} partiellement disponible (publication vers juin {rpg_year+1})'
-    return True, f'RPG {rpg_year} disponible — coordonnées parcelles RPG {rpg_year} accessibles'
+        return True, f"RPG {rpg_year} partiellement disponible (publication vers juin {rpg_year+1})"
+    return True, f"RPG {rpg_year} disponible"
 
 
 def load_rpg_around_center(center, zoom, rpg_year=2024):
-    """
-    Charge les parcelles RPG via WFS IGN autour d'un point central.   
-    #center = list[latitude, longitude], soit st.session_state["map_center"]
-    #zoom   = int, soit st.session_state["map_zoom"]
-    """
-    delta  = max(0.02, 0.5 / (2 ** (zoom - 10)))
+    delta    = max(0.02, 0.5 / (2 ** (zoom - 10)))
     lat_min, lat_max = center[0] - delta, center[0] + delta
     lon_min, lon_max = center[1] - delta * 1.5, center[1] + delta * 1.5
-
     wfs_url = (
-        f'https://data.geopf.fr/wfs/ows?SERVICE=WFS&VERSION=2.0.0&REQUEST=GetFeature'
-        f'&TYPENAMES=RPG.{rpg_year}:parcelles_graphiques'
-        f'&BBOX={lon_min},{lat_min},{lon_max},{lat_max},EPSG:4326'
-        f'&OUTPUTFORMAT=application/json'
+        f"https://data.geopf.fr/wfs/ows?SERVICE=WFS&VERSION=2.0.0&REQUEST=GetFeature"
+        f"&TYPENAMES=RPG.{rpg_year}:parcelles_graphiques"
+        f"&BBOX={lon_min},{lat_min},{lon_max},{lat_max},EPSG:4326"
+        f"&OUTPUTFORMAT=application/json"
     )
     try:
         gdf = gpd.read_file(wfs_url)
         if gdf.crs and gdf.crs.to_epsg() != 4326:
             gdf = gdf.to_crs(epsg=4326)
-        gdf = gdf[gdf['code_cultu'] != 'SNE'].copy()
-        gdf['id_parcel'] = gdf['id_parcel'].astype(str)
+        gdf = gdf[gdf["code_cultu"] != "SNE"].copy()
+        gdf["id_parcel"] = gdf["id_parcel"].astype(str)
         return gdf, (lon_min, lat_min, lon_max, lat_max)
     except Exception as e:
-        st.warning(f'Erreur chargement RPG : {e}')
+        st.warning(f"Erreur chargement RPG : {e}")
         return gpd.GeoDataFrame(), None
 
 
 def find_clicked_parcelle(click_lat, click_lon, gdf):
-    """Recherche spatiale rapide via sindex (R-tree)."""
     if gdf.empty:
         return None
     point = Point(click_lon, click_lat)
@@ -159,10 +128,6 @@ def find_clicked_parcelle(click_lat, click_lon, gdf):
 
 
 def parse_gps_polygon(text):
-    """
-    Parse une liste de points GPS (une paire lat,lon par ligne).
-    Retourne (Polygon, None) ou (None, message_erreur).
-    """
     points = []
     for line in text.strip().splitlines():
         line = line.strip()
@@ -187,7 +152,6 @@ def parse_gps_polygon(text):
 
 
 def surface_from_polygon(poly):
-    """Estime la surface en ha depuis un polygone WGS84."""
     centroid_lat = poly.centroid.y
     lat_m = 111_000
     lon_m = 111_000 * math.cos(math.radians(centroid_lat))
@@ -204,32 +168,29 @@ def surface_from_polygon(poly):
 
 
 def build_map(center, zoom, gdf, selected_ids=None, rpg_enabled=False, draw_enabled=False):
-    """Carte Folium des parcelles RPG, parcelles sélectionnées en bleu.
-    dessin ou construction des parcelles avec coordonnées GPS"""
     if selected_ids is None:
         selected_ids = set()
 
-    m = folium.Map(location=center, zoom_start=zoom, tiles='Esri WorldImagery')
+    m = folium.Map(location=center, zoom_start=zoom, tiles="Esri WorldImagery")
 
-    if rpg_enabled:
+    if rpg_enabled and gdf is not None and not gdf.empty:
         for _, row in gdf.iterrows():
-            pid    = str(row['id_parcel'])
+            pid    = str(row["id_parcel"])
             sel    = pid in selected_ids
-            color  = '#3d9bf0' if sel else '#ffffff'
+            color  = "#3d9bf0" if sel else "#ffffff"
             opac   = 0.65 if sel else 0.15
             weight = 2.5  if sel else 1.0
             folium.GeoJson(
                 row.geometry.__geo_interface__,
                 style_function=lambda _, c=color, o=opac, w=weight: {
-                    'fillColor': c, 'color': c,
-                    'weight': w, 'fillOpacity': o,
-                    'interactive': True,
+                    "fillColor": c, "color": c,
+                    "weight": w, "fillOpacity": o,
                 },
                 tooltip=folium.Tooltip(
-                    f"{row['code_cultu']} | {row.get('surf_parc',0):.1f} ha | id:{pid}"
+                    f"{row['code_cultu']} | {row.get('surf_parc', 0):.1f} ha | id:{pid}"
                 ),
             ).add_to(m)
-    
+
     if draw_enabled:
         Draw(
             export=False,
@@ -244,50 +205,38 @@ def build_map(center, zoom, gdf, selected_ids=None, rpg_enabled=False, draw_enab
             edit_options={"edit": True, "remove": True},
         ).add_to(m)
 
-    # Afficher les parcelles personnalisées (dessin/GPS) déja en session
     for pid, meta in st.session_state["parcelles"].items():
         if meta.get("source") in ("dessin", "gps"):
-            geojson = meta.get("geometry_geojson")
-            if geojson:
+            geom = meta.get("geometry")
+            if geom is not None:
                 folium.GeoJson(
-                    geojson,
+                    geom.__geo_interface__,
                     style_function=lambda _: {
                         "fillColor": "#f0ad4e", "color": "#f0ad4e",
                         "weight": 2.5, "fillOpacity": 0.50,
-                        "interactive": False,
                     },
                     tooltip=folium.Tooltip(
-                        f"[Perso] {meta.get('nom','?')} - {meta.get('surf_parc',0):.1f} ha"
+                        f"[Perso] {meta.get('nom', '?')} - {meta.get('surf_parc', 0):.1f} ha"
                     ),
                 ).add_to(m)
-
-    #instr = (
-    #    "<div style='position:fixed;bottom:20px;left:20px;"
-    #    "background:rgba(0,0,0,0.75);color:white;padding:10px 14px;"
-    #    "border-radius:6px;font-size:12px;z-index:9999;font-family:monospace;"
-    #    "max-width:240px;line-height:1.6'>"
-    #    "<b>Selectionner une parcelle</b><br>"
-    #    "Cliquez sur une zone coloree<br>pour la selectionner."
-    #    "</div>"
-    #)
-    #m.get_root().html.add_child(folium.Element(instr))
     return m
 
-# ── Layout ─────────────────────────────────────────────────────────────────────
+
+# ── Layout ──────────────────────────────────────────────────────────────────
 st.title("Mes Parcelles")
-st.caption("Selectionnez, dessinez ou saisissez vos parcelles a surveiller.")
+st.caption("Sélectionnez, dessinez ou saisissez vos parcelles à surveiller.")
 
 tab_clic, tab_dessin, tab_gps = st.tabs([
     "Clic sur RPG", "Dessiner sur la carte", "Coordonnées GPS"
 ])
 
-# ── Sidebar ────────────────────────────────────────────────────────────────────
+# ── Sidebar ──────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.subheader("Localisation")
     with st.form("search_form"):
         query     = st.text_input("Adresse ou commune",
                                    placeholder="Ex: Melun, Seine-et-Marne")
-        gps_input = st.text_input("Ou coordonnees GPS", placeholder="48.682, 2.581")
+        gps_input = st.text_input("Ou coordonnées GPS", placeholder="48.682, 2.581")
         submitted = st.form_submit_button("Centrer la carte", type="primary")
 
     if submitted:
@@ -314,6 +263,8 @@ with st.sidebar:
         st.info("Aucune parcelle.\nUtilisez la carte ou les onglets.")
     else:
         to_delete = []
+        editing_pid = st.session_state["editing_pid"]
+
         for pid, meta in st.session_state["parcelles"].items():
             source  = meta.get("source", "rpg")
             culture = meta.get("code_cultu", "?")
@@ -322,40 +273,64 @@ with st.sidebar:
                 label = meta.get("nom", "Parcelle perso")
             surface = meta.get("surf_parc", 0)
             badge   = "🟦" if source == "rpg" else "🟧"
-            col_i, col_d = st.columns([4, 1])
-            with col_i:
-                st.markdown(f"{badge} **{label}**  \n`{pid[:12]}` - {surface:.1f} ha")
-            with col_d:
-                if st.button("x", key=f"del_{pid}", help="Retirer"):
-                    to_delete.append(pid)
+
+            # ── Mode normal ────────────────────────────────────────────────
+            if editing_pid != pid:
+                col_i, col_e, col_d = st.columns([3, 1, 1])
+                with col_i:
+                    st.markdown(f"{badge} **{label}**  \n`{pid[:12]}` — {surface:.1f} ha")
+                with col_e:
+                    if st.button("✏️", key=f"edit_{pid}", help="Modifier la culture"):
+                        st.session_state["editing_pid"] = pid
+                        st.rerun()
+                with col_d:
+                    if st.button("✕", key=f"del_{pid}", help="Retirer"):
+                        to_delete.append(pid)
+
+            # ── Mode édition ───────────────────────────────────────────────
+            else:
+                current_culture = meta.get("code_cultu", "BTH")
+                current_idx = list(CODE_CULTU_LABELS.keys()).index(current_culture) \
+                              if current_culture in CODE_CULTU_LABELS else 0
+
+                st.markdown(f"{badge} **{label}**  \n`{pid[:12]}` — {surface:.1f} ha")
+                new_culture = st.selectbox(
+                    "Culture",
+                    options=list(CODE_CULTU_LABELS.keys()),
+                    format_func=lambda k: f"{k} — {CODE_CULTU_LABELS[k]}",
+                    index=current_idx,
+                    key=f"select_culture_{pid}",
+                )
+                col_ok, col_cancel = st.columns(2)
+                with col_ok:
+                    if st.button("✓ OK", key=f"confirm_{pid}", type="primary"):
+                        st.session_state["parcelles"][pid]["code_cultu"] = new_culture
+                        st.session_state["editing_pid"] = None
+                        st.toast(f"Culture mise à jour : {new_culture}")
+                        st.rerun()
+                with col_cancel:
+                    if st.button("Annuler", key=f"cancel_{pid}"):
+                        st.session_state["editing_pid"] = None
+                        st.rerun()
+
+            st.divider()
+
         for pid in to_delete:
             del st.session_state["parcelles"][pid]
         if to_delete:
+            st.session_state["editing_pid"] = None
             st.rerun()
 
-        st.divider()
         total_ha = sum(m.get("surf_parc", 0)
                        for m in st.session_state["parcelles"].values())
         st.metric("Surface totale", f"{total_ha:.1f} ha")
-        st.caption("🟦 RPG  🟧 Personnalisee")
+        st.caption("🟦 RPG  🟧 Personnalisée")
         st.divider()
         if st.button("Lancer l'analyse satellite",
                      type="primary", use_container_width=True):
             st.switch_page("pages/2_Alertes.py")
 
-# ── Calcul bbox ────────────────────────────────────────────────────────────────
-#center = st.session_state["map_center"]
-#zoom   = st.session_state["map_zoom"]
-#delta  = max(0.02, 0.5 / (2 ** (zoom - 10)))
-#lat_min, lat_max = center[0] - delta, center[0] + delta
-#lon_min, lon_max = center[1] - delta * 1.5, center[1] + delta * 1.5
-
-#with st.spinner("Chargement des parcelles RPG..."):
-    #gdf = load_rpg_bbox(lat_min, lon_min, lat_max, lon_max)
-    #gdf, bbox_extent = load_rpg_around_center(center, zoom, rpg_year=2024)
-
 selected_ids = set(st.session_state["parcelles"].keys())
-
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -365,93 +340,82 @@ with tab_clic:
     st.markdown("Naviguez sur la carte et cliquez sur une parcelle pour la sélectionner.")
     map_key_clic = f"map_clic_{len(selected_ids)}"
 
-    rpg_year = st.number_input("Année de référence RPG", value=2024, key="rpg_year", width=300)
-    if rpg_year:
-        ok, msg = check_rpg_availability(rpg_year, st.session_state["today"])
-        #Creation of st.session_state["rpg_year"] with arg: key
+    rpg_year = st.number_input("Année de référence RPG", value=2024,
+                                key="rpg_year", min_value=2021, max_value=2030)
+    ok, msg = check_rpg_availability(int(rpg_year), st.session_state.get("today", __import__("datetime").date.today()))
 
     if ok:
         gdf_rpg, bbox_extent = load_rpg_around_center(
-            st.session_state['map_center'], st.session_state['map_zoom'],
-            rpg_year=st.session_state['rpg_year'])
-        st.markdown(f'RPG {rpg_year} : {msg} ; {len(gdf_rpg)} parcelles RPG chargées')
+            st.session_state["map_center"],
+            st.session_state["map_zoom"],
+            rpg_year=int(rpg_year),
+        )
+        st.markdown(f"RPG {int(rpg_year)} : {msg} — {len(gdf_rpg)} parcelles chargées")
     else:
-        st.warning('⚠️  Données RPG non disponibles pour cette année')
-        gdf_rpg = gpd.GeoDataFrame()
+        st.warning(f"⚠️  {msg}")
+        gdf_rpg    = gpd.GeoDataFrame()
         bbox_extent = None
 
     if gdf_rpg.empty:
-        map_data = False
         st.warning("Aucune parcelle RPG chargée. Centrez la carte sur une zone agricole.")
-
-    if not gdf_rpg.empty:
+    else:
         m_rpg = build_map(
-            center=st.session_state["map_center"], 
+            center=st.session_state["map_center"],
             zoom=st.session_state["map_zoom"],
             gdf=gdf_rpg,
             selected_ids=selected_ids,
-            rpg_enabled=True)
-
+            rpg_enabled=True,
+        )
         map_data = st_folium(
-            m_rpg, 
+            m_rpg,
             width=None,
             height=520,
-            returned_objects=["last_object_clicked","zoom", "center"],
+            returned_objects=["last_object_clicked", "zoom", "center"],
             key=map_key_clic,
-            )
+        )
 
-    
-    #m_clic = build_map(center, zoom, gdf_rpg, selected_ids, draw_enabled=False)
+        col_a, col_b = st.columns(2)
+        col_a.metric("Parcelles RPG visibles", len(gdf_rpg))
+        col_b.metric("Sélectionnées", len(selected_ids))
 
-    #map_data = st_folium(
-        #m_clic,
-        #width=None,
-        #height=520,
-        #returned_objects=["last_object_clicked", "center", "zoom"],
-        #key=map_key_clic,
-    #)
+        if map_data:
+            if map_data.get("center"):
+                st.session_state["map_center"] = [
+                    map_data["center"]["lat"],
+                    map_data["center"]["lng"],
+                ]
+            if map_data.get("zoom"):
+                st.session_state["map_zoom"] = map_data["zoom"]
 
-    col_a, col_b = st.columns(2)
-    col_a.metric("Parcelles RPG visibles", len(gdf_rpg))
-    col_b.metric("Sélectionnees", len(selected_ids))
+            # last_object_clicked (fix vs last_clicked) — tooltips préservés
+            if map_data.get("last_object_clicked") and not gdf_rpg.empty:
+                click_lat = map_data["last_object_clicked"]["lat"]
+                click_lon = map_data["last_object_clicked"]["lng"]
+                parcelle_row = find_clicked_parcelle(click_lat, click_lon, gdf_rpg)
 
-    if map_data:
-        if map_data.get("center"):
-            st.session_state["map_center"] = [
-                map_data["center"]["lat"],
-                map_data["center"]["lng"],
-            ]
-        if map_data.get("zoom"):
-            st.session_state["map_zoom"] = map_data["zoom"]
+                if parcelle_row is not None:
+                    pid = str(parcelle_row.get("id_parcel", ""))
+                    if pid in st.session_state["parcelles"]:
+                        del st.session_state["parcelles"][pid]
+                        st.toast(f"Parcelle {pid[:12]} retirée")
+                    else:
+                        culture = parcelle_row.get("code_cultu", "?")
+                        label   = CODE_CULTU_LABELS.get(culture, culture)
+                        surf    = parcelle_row.get("surf_parc", 0)
+                        geom    = parcelle_row.get("geometry")
+                        min_lon, min_lat, max_lon, max_lat = geom.bounds
+                        st.session_state["parcelles"][pid] = {
+                            "source"    : "rpg",
+                            "code_cultu": culture,
+                            "surf_parc" : surf,
+                            "bbox"      : (min_lon, min_lat, max_lon, max_lat),
+                            "geometry"  : geom,
+                            "lat"       : click_lat,
+                            "lon"       : click_lon,
+                        }
+                        st.toast(f"{label} ({surf:.1f} ha) ajoutée")
+                    st.rerun()
 
-        if map_data.get("last_object_clicked") and not gdf_rpg.empty:
-            click_lat = map_data["last_object_clicked"]["lat"]
-            click_lon = map_data["last_object_clicked"]["lng"]
-            parcelle_row = find_clicked_parcelle(click_lat, click_lon, gdf_rpg) #return dict
-
-            if parcelle_row is not None:
-                pid = str(parcelle_row.get("id_parcel", ""))
-                if pid in st.session_state["parcelles"]:
-                    del st.session_state["parcelles"][pid]
-                    st.toast(f"Parcelle {pid} retiree", icon="X")
-                else:
-                    culture = parcelle_row.get("code_cultu", "?")
-                    label   = CODE_CULTU_LABELS.get(culture, culture)
-                    surf    = parcelle_row.get("surf_parc", 0)
-                    geom    = parcelle_row.get("geometry", [])
-                    min_lon, min_lat, max_lon, max_lat = geom.bounds
-                    st.session_state["parcelles"][pid] = {
-                        "source"           : "rpg",
-                        "code_cultu"       : culture,
-                        "surf_parc"        : surf,
-                        "bbox"             : (min_lon, min_lat, max_lon, max_lat),
-                        #"geometry_geojson" : parcelle_row.geometry.__geo_interface__,
-                        "geometry"         : geom,
-                        "lat"              : click_lat,
-                        "lon"              : click_lon,
-                    }
-                    st.toast(f"{label} ({surf:.1f} ha) ajoutee")#, icon="✅")
-                st.rerun()
 
 # ═════════════════════════════════════════════════════════════════════════════
 # ONGLET 2 — Dessin
@@ -467,11 +431,12 @@ with tab_dessin:
     with col_carte:
         map_key_draw = f"map_draw_{len(selected_ids)}"
         m_draw = build_map(
-            center=st.session_state["map_center"], 
+            center=st.session_state["map_center"],
             zoom=st.session_state["map_zoom"],
-            gdf=None, 
-            selected_ids=selected_ids, 
-            draw_enabled=True)
+            gdf=None,
+            selected_ids=selected_ids,
+            draw_enabled=True,
+        )
         draw_data = st_folium(
             m_draw,
             width=None,
@@ -487,7 +452,7 @@ with tab_dessin:
         culture_dessin = st.selectbox(
             "Culture",
             options=list(CODE_CULTU_LABELS.keys()),
-            format_func=lambda k: f"{k} - {CODE_CULTU_LABELS[k]}",
+            format_func=lambda k: f"{k} — {CODE_CULTU_LABELS[k]}",
             key="culture_dessin",
         )
 
@@ -498,7 +463,7 @@ with tab_dessin:
         if draw_data and draw_data.get("zoom"):
             st.session_state["map_zoom"] = draw_data["zoom"]
 
-        drawing = None
+        drawing     = None
         surf_dessin = 0.0
         if draw_data and draw_data.get("last_active_drawing"):
             drawing = draw_data["last_active_drawing"]
@@ -523,24 +488,25 @@ with tab_dessin:
                 centroid = poly.centroid
                 min_lon, min_lat, max_lon, max_lat = poly.bounds
                 st.session_state["parcelles"][pid] = {
-                    "source"           : "dessin",
-                    "nom"              : nom_dessin.strip(),
-                    "code_cultu"       : culture_dessin,
-                    "surf_parc"        : surf_dessin,
-                    "bbox"             : (min_lon, min_lat, max_lon, max_lat),
-                    #"geometry_geojson" : drawing["geometry"],
-                    "geometry"         : poly,
-                    "lat"              : centroid.y,
-                    "lon"              : centroid.x,
+                    "source"    : "dessin",
+                    "nom"       : nom_dessin.strip(),
+                    "code_cultu": culture_dessin,
+                    "surf_parc" : surf_dessin,
+                    "bbox"      : (min_lon, min_lat, max_lon, max_lat),
+                    "geometry"  : poly,
+                    "lat"       : centroid.y,
+                    "lon"       : centroid.x,
                 }
-                st.toast(f"'{nom_dessin}' ajoutee ({surf_dessin:.2f} ha)")#, icon="✅")
-                #st.rerun()
+                st.toast(f"'{nom_dessin}' ajoutée ({surf_dessin:.2f} ha)")
             except Exception as e:
                 st.error(f"Erreur : {e}")
 
         if not can_add:
             st.caption("Dessinez une parcelle puis nommez-la.")
-
+#################
+# Reste que la parcelle ne s'ajoute pas directement quand on l'ajoute (il n'y a pas de rafraichissement de la page. 
+# Et si on retourne plus tard sur l'onglet (une deuxième fois) la carte ne s'affiche pas. 
+#################
 
 # ═════════════════════════════════════════════════════════════════════════════
 # ONGLET 3 — GPS
@@ -559,7 +525,7 @@ with tab_gps:
         culture_gps = st.selectbox(
             "Culture",
             options=list(CODE_CULTU_LABELS.keys()),
-            format_func=lambda k: f"{k} - {CODE_CULTU_LABELS[k]}",
+            format_func=lambda k: f"{k} — {CODE_CULTU_LABELS[k]}",
             key="culture_gps",
         )
         coords_text = st.text_area(
@@ -578,8 +544,8 @@ with tab_gps:
             else:
                 surf_gps = surface_from_polygon(poly_gps)
                 n_pts    = len(list(poly_gps.exterior.coords)) - 1
-                st.success(f"Polygone valide - {n_pts} points")
-                st.metric("Surface estimee", f"{surf_gps:.2f} ha")
+                st.success(f"Polygone valide — {n_pts} points")
+                st.metric("Surface estimée", f"{surf_gps:.2f} ha")
 
         can_add_gps = poly_gps is not None and nom_gps.strip()
         if st.button("Ajouter cette parcelle", type="primary",
@@ -589,32 +555,31 @@ with tab_gps:
             centroid = poly_gps.centroid
             min_lon, min_lat, max_lon, max_lat = poly_gps.bounds
             st.session_state["parcelles"][pid] = {
-                "source"           : "gps",
-                "nom"              : nom_gps.strip(),
-                "code_cultu"       : culture_gps,
-                "surf_parc"        : surf_gps,
-                "bbox"             : (min_lon, min_lat, max_lon, max_lat),
-                #"geometry_geojson" : poly_gps.__geo_interface__,
-                "geometry"         : poly_gps,
-                "lat"              : centroid.y,
-                "lon"              : centroid.x,
+                "source"    : "gps",
+                "nom"       : nom_gps.strip(),
+                "code_cultu": culture_gps,
+                "surf_parc" : surf_gps,
+                "bbox"      : (min_lon, min_lat, max_lon, max_lat),
+                "geometry"  : poly_gps,
+                "lat"       : centroid.y,
+                "lon"       : centroid.x,
             }
             st.session_state["map_center"] = [centroid.y, centroid.x]
             st.session_state["map_zoom"]   = 15
-            st.toast(f"'{nom_gps}' ajoutee ({surf_gps:.2f} ha)")#, icon="✅")
+            st.toast(f"'{nom_gps}' ajoutée ({surf_gps:.2f} ha)")
             st.rerun()
 
-        with st.expander("Comment obtenir des coordonnees GPS ?"):
+        with st.expander("Comment obtenir des coordonnées GPS ?"):
             st.markdown(
                 "**Google Maps** : clic droit sur votre parcelle. "
-                "Les coordonnees apparaissent en haut du menu contextuel.\n\n"
-                "**Geoportail** : clic droit -> 'Creer un point'.\n\n"
-                "**Smartphone** : epinglez un point sur votre app GPS, "
-                "les details affichent les coordonnees."
+                "Les coordonnées apparaissent en haut du menu contextuel.\n\n"
+                "**Géoportail** : clic droit → 'Créer un point'.\n\n"
+                "**Smartphone** : épinglez un point sur votre app GPS, "
+                "les détails affichent les coordonnées."
             )
 
     with col_apercu:
-        st.markdown("**Apercu de la parcelle**")
+        st.markdown("**Aperçu de la parcelle**")
         lat_ap = st.session_state["map_center"][0]
         lon_ap = st.session_state["map_center"][1]
         if poly_gps is not None:
@@ -630,9 +595,8 @@ with tab_gps:
                 style_function=lambda _: {
                     "fillColor": "#f0ad4e", "color": "#f0ad4e",
                     "weight": 2.5, "fillOpacity": 0.50,
-                    "interactive": True,
                 },
-                tooltip=folium.Tooltip(f"{nom_gps or 'Parcelle'} - {surf_gps:.2f} ha"),
+                tooltip=folium.Tooltip(f"{nom_gps or 'Parcelle'} — {surf_gps:.2f} ha"),
             ).add_to(m_gps)
 
             for i, (lon_p, lat_p) in enumerate(list(poly_gps.exterior.coords)[:-1]):
@@ -643,18 +607,22 @@ with tab_gps:
                     tooltip=f"Point {i+1} : {lat_p:.5f}, {lon_p:.5f}",
                 ).add_to(m_gps)
 
+        # Parcelles GPS déjà enregistrées
         for pid, meta in st.session_state["parcelles"].items():
             if meta.get("source") == "gps":
-                geojson = meta.get("geometry_geojson")
-                if geojson:
+                geom = meta.get("geometry")
+                if geom is not None:
                     folium.GeoJson(
-                        geojson,
+                        geom.__geo_interface__,
                         style_function=lambda _: {
                             "fillColor": "#f0ad4e", "color": "#f0ad4e",
                             "weight": 1.5, "fillOpacity": 0.30,
-                            "interactive": True,
                         },
                         tooltip=folium.Tooltip(meta.get("nom", "?")),
                     ).add_to(m_gps)
 
         st_folium(m_gps, width=None, height=400, key="map_gps_preview")
+        
+############
+# Pour une facilité d'utilisation, il faudrait penser à créer un fichier qui sauvegarde les parcelles déjà sélectionnées, pour ne pas avoir à les reselectionner à chaque fois. Ca veut dire qu'avant tout il faut vérifier si un tel fichier existe et dans ce cas charger les parcelles déjà existantes. Et puis il faut un bouton qui permet de nettoyer ce fichier qui sera mis à jour, par exemple, à chaque fois qu'on lance une analyse des parcelles. Quand on passe de la page 1 à la page 2 quoi. 
+############
