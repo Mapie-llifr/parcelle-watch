@@ -2,18 +2,20 @@
 app/pages/2_Alertes.py
 -----------------------
 Page des alertes de stress hydrique.
-- Téléchargement scène Sentinel-2 + météo
+- Téléchargement scène Sentinel-2 nommée par bbox+date (évite les faux caches)
+- Météo 14j
 - Feature engineering + inférence Isolation Forest
 - Carte des résultats avec filtres (culture, sévérité)
 - Analyse intra-parcellaire déclenchée par sélection dans le tableau
+- Bouton nettoyage des TIF téléchargés
 """
 
 import sys
+import hashlib
 from pathlib import Path
 from datetime import date, timedelta
 
 import folium
-import geopandas as gpd
 import matplotlib.colors as mcolors
 import matplotlib.pyplot as plt
 import numpy as np
@@ -22,7 +24,7 @@ import rasterio
 import rasterio.features
 import joblib
 import streamlit as st
-from shapely.geometry import Point, box as sbox, mapping
+from shapely.geometry import box as sbox, mapping
 from streamlit_folium import st_folium
 from sentinelhub import BBox, CRS
 
@@ -38,7 +40,7 @@ ROOT       = Path(__file__).parent.parent.parent
 DATA_PROC  = ROOT / "data" / "processed"
 DATA_RAW   = ROOT / "data" / "raw"
 MODELS_DIR = DATA_PROC / "models"
-DOCS_DIR   = ROOT / "docs"
+SCENES_DIR = DATA_RAW / "interface_test"
 BBOX_LIMIT = 4
 
 CODE_CULTU_LABELS = {
@@ -61,7 +63,8 @@ FEATURE_COLS = [
 for key, default in [
     ("tif_path", None), ("date_acq", None), ("meteo_df", None),
     ("df_features", None), ("df_results", None),
-    ("intra_pid", None),          # parcelle sélectionnée pour intra-parcellaire
+    ("intra_pid", None),       # parcelle affichée en intra (indépendant du tableau)
+    ("intra_closed", False),   # flag pour ignorer la sélection tableau après fermeture
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
@@ -75,8 +78,10 @@ if "parcelles" not in st.session_state:
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
+
 def sev_color(sev):
-    return {"critical": "#d9534f", "warning": "#f0ad4e", "normal": "#5cb85c"}.get(sev, "#aaaaaa")
+    return {"critical": "#d9534f", "warning": "#f0ad4e",
+            "normal": "#5cb85c"}.get(sev, "#aaaaaa")
 
 
 def global_bbox(parcelles):
@@ -87,6 +92,18 @@ def global_bbox(parcelles):
         max(p["bbox"][2] for p in parcelles.values()) + margin,
         max(p["bbox"][3] for p in parcelles.values()) + margin,
     )
+
+
+def bbox_hash(minx, miny, maxx, maxy) -> str:
+    """Hash court de la bbox pour nommer les TIF de façon unique par zone."""
+    key = f"{minx:.5f}_{miny:.5f}_{maxx:.5f}_{maxy:.5f}"
+    return hashlib.md5(key.encode()).hexdigest()[:8]
+
+
+def scene_path(bbox_h: str, acq_date: date) -> Path:
+    """Chemin du TIF : sentinel2_<bbox_hash>_<YYYYMMDD>.tif"""
+    SCENES_DIR.mkdir(parents=True, exist_ok=True)
+    return SCENES_DIR / f"sentinel2_{bbox_h}_{acq_date.strftime('%Y%m%d')}.tif"
 
 
 def zonal_stats_parcel(geom, index_arr, transform, min_pixels=2):
@@ -148,15 +165,15 @@ def score_row(row, feature_cols):
     except FileNotFoundError as e:
         st.warning(f"⚠️  {row['parcelle_id']} : {e}")
         return np.nan, False, "unknown", "N/A"
-    model  = model_data["model"]
-    scaler = model_data["scaler"]
-    feats  = model_data.get("features", feature_cols)
-    X      = row[feats].values.reshape(1, -1)
-    X      = np.nan_to_num(X, nan=0.0)
-    X_sc   = scaler.transform(X)
-    score  = float(model.decision_function(X_sc)[0])
+    model   = model_data["model"]
+    scaler  = model_data["scaler"]
+    feats   = model_data.get("features", feature_cols)
+    X       = row[feats].values.reshape(1, -1)
+    X       = np.nan_to_num(X, nan=0.0)
+    X_sc    = scaler.transform(X)
+    score   = float(model.decision_function(X_sc)[0])
     is_anom = bool(model.predict(X_sc)[0] == -1)
-    sev = "critical" if score < -0.12 else "warning" if score < -0.04 else "normal"
+    sev     = "critical" if score < -0.12 else "warning" if score < -0.04 else "normal"
     return score, is_anom, sev, model_data.get("model_name", "general")
 
 
@@ -179,10 +196,16 @@ def build_grid(geom, n):
     return cells
 
 
-def run_intra_parcellaire(pid, parcelles_session, tif_path, ndwi_arr, transform):
+def run_intra_parcellaire(pid, parcelles_session, ndwi_arr, transform):
     """
     Calcule et affiche l'analyse intra-parcellaire pour une parcelle.
-    Retourne (fig_heatmap, df_cells, eau_stats) ou lève une exception.
+    Retourne (fig, m_intra, df_cells, eau_stats).
+
+    Correction du bug "moitié basse" :
+    - Les cellules Shapely sont en coordonnées géo (y croît vers le haut).
+    - Le raster rasterio a son origine en haut à gauche (y décroît vers le bas).
+    - On ne stocke PAS en inversant row dans matrix : on stocke directement
+      matrix[row, col] et on inverse uniquement à l'affichage imshow.
     """
     meta   = parcelles_session[pid]
     geom   = meta["geometry"]
@@ -190,36 +213,38 @@ def run_intra_parcellaire(pid, parcelles_session, tif_path, ndwi_arr, transform)
     grid_n = 5 if surf >= 15 else 3 if surf >= 5 else 2
 
     cells  = build_grid(geom, grid_n)
+    # matrix[row, col] : row=0 = bas géo, row=grid_n-1 = haut géo
     matrix = np.full((grid_n, grid_n), np.nan)
     areas  = np.zeros((grid_n, grid_n))
 
     for cell in cells:
         stats = zonal_stats_parcel(cell["geometry"], ndwi_arr, transform)
         if stats:
-            matrix[grid_n - 1 - cell["row"], cell["col"]] = stats["mean"]
-            areas[grid_n  - 1 - cell["row"], cell["col"]] = cell["area_ha"]
+            # Stockage direct sans inversion : on inversera à l'affichage
+            matrix[cell["row"], cell["col"]] = stats["mean"]
+            areas[cell["row"],  cell["col"]] = cell["area_ha"]
 
-    # Heatmap matplotlib
+    # Heatmap : imshow affiche row=0 en haut → on flippe pour avoir le nord en haut
+    display_matrix = np.flipud(matrix)
+
     fig, ax = plt.subplots(figsize=(5, 5))
     norm    = mcolors.TwoSlopeNorm(vmin=-0.5, vcenter=-0.15, vmax=0.2)
-    im      = ax.imshow(matrix, cmap=plt.cm.RdYlBu, norm=norm, aspect="equal")
+    im      = ax.imshow(display_matrix, cmap=plt.cm.RdYlBu, norm=norm, aspect="equal")
     plt.colorbar(im, ax=ax, label="NDWI", fraction=0.04)
-    for r in range(grid_n):
+    for r_disp in range(grid_n):
         for c in range(grid_n):
-            v = matrix[r, c]
+            v = display_matrix[r_disp, c]
             if not np.isnan(v):
                 icon = "🔴" if v < -0.3 else "🟠" if v < -0.15 else "🟢"
-                ax.text(c, r, f"{icon}\n{v:.2f}", ha="center", va="center",
+                ax.text(c, r_disp, f"{icon}\n{v:.2f}", ha="center", va="center",
                         fontsize=9, color="white" if v < -0.2 else "black",
                         fontweight="bold")
-    nom = meta.get("nom", pid)
+    nom = meta.get("nom", pid[:12])
     ax.set_title(
-        f"{nom} ({meta['code_cultu']})\n"
-        f"NDWI intra-parcellaire — grille {grid_n}×{grid_n}",
+        f"{nom} ({meta['code_cultu']})\nNDWI intra-parcellaire — grille {grid_n}×{grid_n}",
         fontsize=10,
     )
-    ax.set_xticks(range(grid_n))
-    ax.set_yticks(range(grid_n))
+    ax.set_xticks(range(grid_n)); ax.set_yticks(range(grid_n))
     plt.tight_layout()
 
     # Carte Folium intra
@@ -233,9 +258,9 @@ def run_intra_parcellaire(pid, parcelles_session, tif_path, ndwi_arr, transform)
             "weight": 2, "interactive": False,
         },
     ).add_to(m_intra)
+
     for cell in cells:
-        r, c = cell["row"], cell["col"]
-        val  = matrix[grid_n - 1 - r, c]
+        val = matrix[cell["row"], cell["col"]]
         if np.isnan(val):
             continue
         color = "#d9534f" if val < -0.3 else "#f0ad4e" if val < -0.15 else \
@@ -259,11 +284,9 @@ def run_intra_parcellaire(pid, parcelles_session, tif_path, ndwi_arr, transform)
         ).add_to(m_intra)
 
     # Économie d'eau
-    stress_ha    = sum(
-        cell["area_ha"] for cell in cells
-        if not np.isnan(matrix[grid_n - 1 - cell["row"], cell["col"]])
-        and matrix[grid_n - 1 - cell["row"], cell["col"]] < -0.15
-    )
+    stress_ha    = sum(cell["area_ha"] for cell in cells
+                       if not np.isnan(matrix[cell["row"], cell["col"]])
+                       and matrix[cell["row"], cell["col"]] < -0.15)
     total_ha     = sum(c["area_ha"] for c in cells)
     apport_mm    = 30
     eau_uniforme = total_ha  * apport_mm * 10
@@ -277,24 +300,18 @@ def run_intra_parcellaire(pid, parcelles_session, tif_path, ndwi_arr, transform)
         "economie": economie, "pct": pct, "apport_mm": apport_mm,
     }
 
-    # DataFrame cellules pour affichage
-    df_cells = pd.DataFrame([
-        {
-            "Cellule"  : cell["cell_id"],
-            "NDWI"     : round(matrix[grid_n - 1 - cell["row"], cell["col"]], 3)
-                         if not np.isnan(matrix[grid_n - 1 - cell["row"], cell["col"]])
-                         else None,
-            "Surface ha": cell["area_ha"],
-            "Statut"   : (
-                "Critique" if not np.isnan(matrix[grid_n-1-cell["row"], cell["col"]])
-                              and matrix[grid_n-1-cell["row"], cell["col"]] < -0.3
-                else "Modéré"  if not np.isnan(matrix[grid_n-1-cell["row"], cell["col"]])
-                              and matrix[grid_n-1-cell["row"], cell["col"]] < -0.15
-                else "Normal"
-            ),
-        }
-        for cell in cells
-    ])
+    # DataFrame cellules
+    df_cells = pd.DataFrame([{
+        "Cellule"    : cell["cell_id"],
+        "NDWI"       : round(matrix[cell["row"], cell["col"]], 3)
+                       if not np.isnan(matrix[cell["row"], cell["col"]]) else None,
+        "Surface ha" : cell["area_ha"],
+        "Statut"     : ("Critique" if not np.isnan(matrix[cell["row"], cell["col"]])
+                                   and matrix[cell["row"], cell["col"]] < -0.3
+                        else "Modéré" if not np.isnan(matrix[cell["row"], cell["col"]])
+                                     and matrix[cell["row"], cell["col"]] < -0.15
+                        else "Normal"),
+    } for cell in cells])
 
     return fig, m_intra, df_cells, eau_stats
 
@@ -310,10 +327,28 @@ if not parcelles_session:
     st.warning("Aucune parcelle sélectionnée — revenez à la page 'Mes Parcelles'.")
     st.stop()
 
+# ── Sidebar : nettoyage TIF ──────────────────────────────────────────────────
+with st.sidebar:
+    st.subheader("Gestion des données")
+    tif_files = list(SCENES_DIR.glob("sentinel2_*.tif")) if SCENES_DIR.exists() else []
+    total_mb  = sum(f.stat().st_size for f in tif_files) / 1_048_576
+
+    if tif_files:
+        st.caption(f"{len(tif_files)} image(s) — {total_mb:.1f} Mo")
+        if st.button("🗑️ Supprimer toutes les images", use_container_width=True):
+            for f in tif_files:
+                f.unlink(missing_ok=True)
+            st.toast(f"{len(tif_files)} image(s) supprimée(s)")
+            st.rerun()
+    else:
+        st.caption("Aucune image en cache")
+
 # ── Étape 1 : Scène satellite ────────────────────────────────────────────────
 minx, miny, maxx, maxy = global_bbox(parcelles_session)
 sh_bbox = BBox(bbox=[minx, miny, maxx, maxy], crs=CRS.WGS84)
-st.markdown(f"Bbox : `{minx:.4f},{miny:.4f} → {maxx:.4f},{maxy:.4f}`")
+bbox_h  = bbox_hash(minx, miny, maxx, maxy)
+
+st.markdown(f"Bbox : `{minx:.4f},{miny:.4f} → {maxx:.4f},{maxy:.4f}` (hash: `{bbox_h}`)")
 
 if (minx - maxx) ** 2 > BBOX_LIMIT or (miny - maxy) ** 2 > BBOX_LIMIT:
     st.warning("Les parcelles sélectionnées sont trop éloignées pour une seule image satellite.")
@@ -323,6 +358,11 @@ config  = get_sh_config()
 end_d   = st.session_state["today"]
 start_d = end_d - timedelta(days=30)
 
+lat_c = (miny + maxy) / 2
+lon_c = (minx + maxx) / 2
+st.markdown(f'latitude central {lat_c}, et longitude centrale {lon_c}')
+st.session_state['map_center'] = [lat_c, lon_c]
+
 with st.spinner(f"Recherche scènes du {start_d} au {end_d}..."):
     scenes = search_available_scenes(sh_bbox, start_d, end_d,
                                      max_cloud_coverage=0.30, config=config)
@@ -331,28 +371,32 @@ if not scenes:
     st.warning("⚠️  Aucune scène disponible — couverture nuageuse trop importante.")
     st.stop()
 
-latest = scenes[-1]
-st.session_state["date_acq"] = latest["date"]
-st.markdown(f"Scène retenue : **{latest['date']}** (nuages : {latest['cloud_coverage']:.1f}%)")
+latest   = scenes[-1]
+date_acq = latest["date"]
+st.session_state["date_acq"] = date_acq
+st.markdown(f"Scène retenue : **{date_acq}** (nuages : {latest['cloud_coverage']:.1f}%)")
 
-out_dir  = DATA_RAW / "interface_test"
-out_dir.mkdir(parents=True, exist_ok=True)
+# Nom du TIF inclut le hash bbox → deux zones différentes = deux fichiers distincts
+tif_path = scene_path(bbox_h, date_acq)
 
-with st.spinner("Téléchargement de la scène..."):
-    tif_path = download_scene(
-        bbox=sh_bbox, acquisition_date=st.session_state["date_acq"],
-        output_dir=out_dir, config=config,
-    )
+if tif_path.exists():
+    st.info(f"Image déjà en cache : `{tif_path.name}`")
+else:
+    with st.spinner("Téléchargement de la scène..."):
+        tif_path = download_scene(
+            bbox=sh_bbox, acquisition_date=date_acq,
+            output_dir=SCENES_DIR, config=config,
+        )
+        # Renommer selon la convention bbox_hash si download_scene génère un autre nom
+        expected = scene_path(bbox_h, date_acq)
+        if tif_path != expected:
+            tif_path.rename(expected)
+            tif_path = expected
+
 st.session_state["tif_path"] = tif_path
-st.success(f"TIF téléchargé : `{tif_path.name}`")
-
-#################
-# Il faut trouver le moyen d'intégrer la zone de vue dans le nom de l'image satellite parce que si on rajoute dans la même journée d'autres parcelles qui ne sont pas dans la zone l'image n'est pas retéléchargées et la nouvelle parcelle n'apparait pas. 
-# Je pense qu'il faudrait aussi un bouton pour effacer les images téléchargées précedemment, parce que l'agriculteur il va pas se charger son ordi avec des millions de vues satellite. 
-#################
+st.success(f"TIF : `{tif_path.name}`")
 
 # ── Étape 2 : Météo ──────────────────────────────────────────────────────────
-date_acq    = st.session_state["date_acq"]
 lat_c       = (miny + maxy) / 2
 lon_c       = (minx + maxx) / 2
 meteo_start = date_acq - timedelta(days=14)
@@ -364,11 +408,11 @@ st.session_state["meteo_df"] = meteo_df
 st.success(f"Météo : {len(meteo_df)} jours ({meteo_start} → {date_acq})")
 
 # ── Étape 3 : Features + inférence ──────────────────────────────────────────
-bands, meta  = load_bands(tif_path)
-ndvi_arr     = compute_ndvi(bands)
-ndwi_arr     = compute_ndwi(bands)
-transform    = meta["transform"]
-meteo_feat   = compute_meteo_features(meteo_df, date_acq)
+bands, meta = load_bands(tif_path)
+ndvi_arr    = compute_ndvi(bands)
+ndwi_arr    = compute_ndwi(bands)
+transform   = meta["transform"]
+meteo_feat  = compute_meteo_features(meteo_df, date_acq)
 
 rows = []
 for pid, pmeta in parcelles_session.items():
@@ -403,7 +447,6 @@ if not rows:
 df_feat = pd.DataFrame(rows)
 st.session_state["df_features"] = df_feat
 
-# Inférence
 results = []
 for _, row in df_feat.iterrows():
     score, is_anom, sev, model_name = score_row(row, FEATURE_COLS)
@@ -445,13 +488,11 @@ with col_f2:
         key="filter_sev",
     )
 with col_f3:
-    # Tri
     sort_by = st.selectbox(
         "Trier par", ["Score (pire en premier)", "Surface", "Culture"],
         key="filter_sort",
     )
 
-# Application des filtres
 df_filtered = df_res.copy()
 if sel_cultures:
     df_filtered = df_filtered[df_filtered["code_cultu"].isin(sel_cultures)]
@@ -460,12 +501,13 @@ if sev_filter == "Attention et critique":
 elif sev_filter == "Critique uniquement":
     df_filtered = df_filtered[df_filtered["severity"] == "critical"]
 
-if sort_by == "Score (pire en premier)":
-    df_filtered = df_filtered.sort_values("anomaly_score")
-elif sort_by == "Surface":
-    df_filtered = df_filtered.sort_values("surf_parc", ascending=False)
-elif sort_by == "Culture":
-    df_filtered = df_filtered.sort_values("code_cultu")
+sort_map = {
+    "Score (pire en premier)": ("anomaly_score", True),
+    "Surface": ("surf_parc", False),
+    "Culture": ("code_cultu", True),
+}
+sort_col, sort_asc = sort_map[sort_by]
+df_filtered = df_filtered.sort_values(sort_col, ascending=sort_asc)
 
 # ── Métriques ─────────────────────────────────────────────────────────────────
 m1, m2, m3, m4 = st.columns(4)
@@ -480,24 +522,19 @@ st.divider()
 
 # ── Carte + Tableau ───────────────────────────────────────────────────────────
 col_map, col_tbl = st.columns([3, 2])
-
-# Ensemble des IDs filtrés (pour n'afficher que les parcelles visibles)
 filtered_ids = set(df_filtered["parcelle_id"].astype(str).tolist())
 
 with col_map:
     date_str = date_acq.strftime("%d %B %Y")
-    m_folium = folium.Map(
-        location=st.session_state["map_center"],
-        zoom_start=14,
-    )
+    m_folium = folium.Map(location=st.session_state["map_center"], zoom_start=14)
 
-    title_html = (
+    m_folium.get_root().html.add_child(folium.Element(
         f"<div style='position:fixed;top:10px;left:50%;transform:translateX(-50%);"
         f"background:rgba(0,0,0,0.75);color:white;padding:8px 14px;"
         f"border-radius:6px;font-size:13px;z-index:9999;font-family:monospace;'>"
         f"Parcelle Watch — Stress hydrique — {date_str}</div>"
-    )
-    legend_html = (
+    ))
+    m_folium.get_root().html.add_child(folium.Element(
         "<div style='position:fixed;bottom:20px;right:20px;"
         "background:rgba(0,0,0,0.8);color:white;padding:10px 14px;"
         "border-radius:6px;font-size:11px;z-index:9999;font-family:monospace;'>"
@@ -506,20 +543,18 @@ with col_map:
         "<span style='color:#f0ad4e'>■</span> Attention<br>"
         "<span style='color:#5cb85c'>■</span> Normal<br>"
         "<span style='color:#cccccc'>■</span> Filtré</div>"
-    )
-    m_folium.get_root().html.add_child(folium.Element(title_html))
-    m_folium.get_root().html.add_child(folium.Element(legend_html))
+    ))
 
     res_by_id = df_res.set_index("parcelle_id").to_dict("index")
 
     for pid, pmeta in parcelles_session.items():
-        r      = res_by_id.get(pid, {})
+        r         = res_by_id.get(pid, {})
         in_filter = pid in filtered_ids
-        sev    = r.get("severity", "unknown") if in_filter else "filtered"
-        color  = sev_color(sev) if in_filter else "#cccccc"
-        ndwi_s = f"{r.get('ndwi_mean', 0):.3f}" if r else "N/A"
-        score_s = f"{r.get('anomaly_score', 0):.3f}" if r else "N/A"
-        opacity = 0.65 if in_filter else 0.2
+        sev       = r.get("severity", "unknown") if in_filter else "filtered"
+        color     = sev_color(sev) if in_filter else "#cccccc"
+        opacity   = 0.65 if in_filter else 0.2
+        ndwi_s    = f"{r.get('ndwi_mean', 0):.3f}" if r else "N/A"
+        score_s   = f"{r.get('anomaly_score', 0):.3f}" if r else "N/A"
 
         popup_html = (
             f"<div style='font-family:monospace;font-size:12px;min-width:170px'>"
@@ -527,8 +562,7 @@ with col_map:
             f"Culture : <b>{pmeta['code_cultu']}</b><br>"
             f"Surface : {pmeta['surf_parc']:.1f} ha<br>"
             f"<hr style='margin:3px 0'>"
-            f"NDWI : {ndwi_s}<br>"
-            f"Score : {score_s}<br>"
+            f"NDWI : {ndwi_s}<br>Score : {score_s}<br>"
             f"Sévérité : <b style='color:{color}'>{sev.upper()}</b>"
             f"{'<br><i>(filtré)</i>' if not in_filter else ''}"
             f"</div>"
@@ -536,8 +570,7 @@ with col_map:
         folium.GeoJson(
             pmeta["geometry"].__geo_interface__,
             style_function=lambda _, c=color, o=opacity: {
-                "fillColor": c, "color": "white",
-                "weight": 1.5, "fillOpacity": o,
+                "fillColor": c, "color": "white", "weight": 1.5, "fillOpacity": o,
             },
             tooltip=folium.Tooltip(f"{pmeta['code_cultu']} — {sev.upper()}"),
             popup=folium.Popup(popup_html, max_width=200),
@@ -548,7 +581,6 @@ with col_map:
 with col_tbl:
     st.subheader("Tableau des alertes")
 
-    # Tableau cliquable — sélection pour intra-parcellaire
     df_display = df_filtered[[
         "parcelle_id", "code_cultu", "surf_parc",
         "ndwi_mean", "anomaly_score", "severity",
@@ -563,35 +595,39 @@ with col_tbl:
     for c in ["NDWI", "Score"]:
         if c in df_display.columns:
             df_display[c] = df_display[c].round(3)
-
-    # Raccourcir l'ID pour l'affichage
     df_display["Parcelle"] = df_display["Parcelle"].str[:12]
 
     if df_display.empty:
         st.info("Aucune parcelle pour ces filtres.")
     else:
-        # st.dataframe avec selection
         event = st.dataframe(
             df_display,
             use_container_width=True,
-            height=420,
+            height=380,
             hide_index=True,
             on_select="rerun",
             selection_mode="single-row",
             key="tbl_alertes",
         )
 
-        selected_rows = event.selection.get("rows", []) if event and event.selection else []
-        if selected_rows:
-            row_idx = selected_rows[0]
-            # Récupérer le pid complet depuis df_filtered (même ordre)
+        selected_rows = (event.selection.get("rows", [])
+                         if event and event.selection else [])
+
+        # Si une ligne est sélectionnée ET qu'on n'est pas en mode "fermé",
+        # on met à jour intra_pid.
+        if selected_rows and not st.session_state.get("intra_closed", False):
+            row_idx  = selected_rows[0]
             full_pid = df_filtered.iloc[row_idx]["parcelle_id"]
             if full_pid != st.session_state["intra_pid"]:
                 st.session_state["intra_pid"] = full_pid
+                st.rerun()
+        # Réinitialiser le flag après lecture
+        if st.session_state.get("intra_closed", False):
+            st.session_state["intra_closed"] = False
 
         if st.session_state["intra_pid"] is not None:
             st.caption(
-                f"↓ Analyse intra-parcellaire : `{str(st.session_state['intra_pid'])[:12]}`"
+                f"↓ Analyse : `{str(st.session_state['intra_pid'])[:12]}`"
             )
 
 st.divider()
@@ -608,18 +644,29 @@ else:
     if pmeta is None:
         st.warning("Parcelle introuvable en session.")
     else:
-        nom  = pmeta.get("nom", intra_pid[:12])
-        surf = pmeta["surf_parc"]
+        nom    = pmeta.get("nom", intra_pid[:12])
+        surf   = pmeta["surf_parc"]
         grid_n = 5 if surf >= 15 else 3 if surf >= 5 else 2
 
-        st.subheader(f"Analyse intra-parcellaire — {nom} ({pmeta['code_cultu']}) — grille {grid_n}×{grid_n}")
+        col_title, col_close = st.columns([5, 1])
+        with col_title:
+            st.subheader(
+                f"Intra-parcellaire — {nom} ({pmeta['code_cultu']}) — grille {grid_n}×{grid_n}"
+            )
+        with col_close:
+            # Bouton fermer : réinitialise intra_pid + pose le flag pour ignorer
+            # la sélection résiduelle du tableau au prochain rerun
+            if st.button("✕ Fermer", key="btn_close_intra"):
+                st.session_state["intra_pid"]    = None
+                st.session_state["intra_closed"] = True
+                st.rerun()
 
         col_heat, col_carte_intra = st.columns([1, 2])
 
-        with st.spinner("Calcul de la grille intra-parcellaire..."):
+        with st.spinner("Calcul de la grille..."):
             try:
                 fig, m_intra, df_cells, eau = run_intra_parcellaire(
-                    intra_pid, parcelles_session, tif_path, ndwi_arr, transform
+                    intra_pid, parcelles_session, ndwi_arr, transform
                 )
 
                 with col_heat:
@@ -630,9 +677,7 @@ else:
                     st_folium(m_intra, width=None, height=400,
                                key=f"map_intra_{intra_pid}")
 
-                # Tableau cellules + économie d'eau
                 col_cells, col_eau = st.columns([2, 1])
-
                 with col_cells:
                     st.markdown("**Détail par cellule**")
                     st.dataframe(df_cells, use_container_width=True,
@@ -640,30 +685,15 @@ else:
 
                 with col_eau:
                     st.markdown("**Économie d'eau estimée**")
-                    st.markdown(
-                        f"Hypothèse : **{eau['apport_mm']} mm/ha**"
-                    )
-                    st.metric(
-                        "Surface en stress (NDWI < -0.15)",
-                        f"{eau['stress_ha']:.1f} ha / {eau['total_ha']:.1f} ha",
-                    )
+                    st.caption(f"Hypothèse : {eau['apport_mm']} mm/ha")
+                    st.metric("Surface en stress",
+                               f"{eau['stress_ha']:.1f} / {eau['total_ha']:.1f} ha")
                     st.metric("Irrigation uniforme",  f"{eau['eau_uniforme']:.0f} m³")
                     st.metric("Irrigation ciblée",    f"{eau['eau_ciblee']:.0f} m³")
-                    delta_col = "normal" if eau["economie"] >= 0 else "inverse"
-                    st.metric(
-                        "Économie potentielle",
-                        f"{eau['economie']:.0f} m³",
-                        delta=f"{eau['pct']:.0f}%",
-                        delta_color=delta_col,
-                    )
+                    st.metric("Économie potentielle",
+                               f"{eau['economie']:.0f} m³",
+                               delta=f"{eau['pct']:.0f}%",
+                               delta_color="normal" if eau["economie"] >= 0 else "inverse")
 
             except Exception as e:
                 st.error(f"Erreur analyse intra-parcellaire : {e}")
-
-        if st.button("Fermer l'analyse intra-parcellaire"):
-            st.session_state["intra_pid"] = None
-            st.rerun()
-##############
-# Pour l'analyse intraparcellaire, on n'analyse que la moitié basse de la parcelle, bizarre. 
-# Et pour fermer l'analyse intraparcellaire, on est obligé de déselectionner la ligne dans le tableau d'abord, c'est dommage. 
-##############
