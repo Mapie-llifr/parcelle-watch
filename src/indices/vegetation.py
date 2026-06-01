@@ -48,16 +48,20 @@ def load_bands(tif_path: Path) -> dict[str, np.ndarray]:
         Dict {'B04': array, 'B03': array, ...} avec valeurs float [0, 1]
     """
     band_names = ["B04", "B03", "B02", "B05", "B08", "B8A", "B11"]
-
     with rasterio.open(tif_path) as src:
+        n_bands = src.count
+        if n_bands < len(band_names):
+            raise ValueError(
+                f"{tif_path.name} : {n_bands} bandes trouvées, "
+                f"{len(band_names)} attendues. "
+                f"Re-télécharger avec l'evalscript 7 bandes."
+            )
         bands = {}
         for i, name in enumerate(band_names, start=1):
             data = src.read(i).astype(np.float32)
-            # Normalisation : Sentinel-2 L2A → réflectance [0, 1]
             data = np.where(data > 0, data / 10000.0, np.nan)
             bands[name] = data
         meta = src.meta
-
     return bands, meta
 
 

@@ -59,10 +59,10 @@ function setup() {
 function evaluatePixel(sample) {
     return [
         sample.B04,   // bande 1 — Rouge      → NDVI, EVI
-        sample.B05,   // bande 2 — Red Edge   → NDRE
+        sample.B05,   // bande 2 — Red Edge      → NDRE
         sample.B08,   // bande 3 — PIR large  → NDVI, NDRE, EVI
         sample.B8A,   // bande 4 — PIR étroit → NDRE
-        sample.B11,   // bande 5 — SWIR       → NDWI
+        sample.B11,   // bande 5 — SWIR              → NDWI
         sample.B03    // bande 6 — Vert       → NDWI, EVI
     ];
 }
@@ -81,13 +81,13 @@ function setup() {
 }
 function evaluatePixel(sample) {
     return [
-        sample.B04,   // bande 1 — Rouge    → NDVI, EVI
-        sample.B03,   // bande 2 — Vert     → NDWI, EVI  
-        sample.B02,   // bande 3 — Bleu     → RGB visible
-        sample.B05,   // bande 4 — Red Edge → NDRE
-        sample.B08,   // bande 5 — PIR large → NDVI, NDRE, EVI
-        sample.B8A,   // bande 6 — PIR étroit → NDRE
-        sample.B11,   // bande 7 — SWIR     → NDWI
+        sample.B04,   // bande 1 — Rouge        → NDVI, EVI
+        sample.B03,   // bande 2 — Vert         → NDWI, EVI  
+        sample.B02,   // bande 3 — Bleu         → RGB visible
+        sample.B05,   // bande 4 — Red Edge         → NDRE
+        sample.B08,   // bande 5 — PIR large    → NDVI, NDRE, EVI
+        sample.B8A,   // bande 6 — PIR étroit   → NDRE
+        sample.B11,   // bande 7 — SWIR                 → NDWI
     ];
 }
 """
@@ -378,7 +378,7 @@ def download_time_series_batch(
 
         try:
             request = SentinelHubRequest(
-                evalscript=EVALSCRIPT_6BANDS,
+                evalscript=EVALSCRIPT_7BANDS,
                 input_data=[
                     SentinelHubRequest.input_data(
                         data_collection=DataCollection.SENTINEL2_L1C.define_from(
