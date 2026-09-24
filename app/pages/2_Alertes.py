@@ -1,13 +1,9 @@
 """
 app/pages/2_Alertes.py
 -----------------------
-Page des alertes de stress hydrique.
-- Téléchargement scène Sentinel-2 nommée par bbox+date (évite les faux caches)
-- Météo 14j
-- Feature engineering + inférence Isolation Forest
-- Carte des résultats avec filtres (culture, sévérité)
-- Analyse intra-parcellaire déclenchée par sélection dans le tableau
-- Bouton nettoyage des TIF téléchargés
+Page des alertes — stress hydrique, azoté, ravageurs.
+Inférence par cellules 100m×100m, agrégation sévérité parcelle = max cellules.
+Onglets par type de stress.
 """
 
 import sys
@@ -21,16 +17,14 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import rasterio
-import rasterio.features
-import joblib
 import streamlit as st
-from shapely.geometry import box as sbox, mapping
 from streamlit_folium import st_folium
 from sentinelhub import BBox, CRS
 
 from src.ingestion.sentinel2 import get_sh_config, search_available_scenes, download_scene
 from src.ingestion.meteo import fetch_historical_weather
-from src.indices.vegetation import compute_ndvi, compute_ndwi, load_bands
+from src.indices.vegetation import load_bands
+from src.models.anomaly_detection import infer_parcel_by_cells
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
@@ -43,41 +37,34 @@ MODELS_DIR = DATA_PROC / "models"
 SCENES_DIR = DATA_RAW / "interface_test"
 BBOX_LIMIT = 4
 
-CODE_CULTU_LABELS = {
-    "BTH": "Ble tendre hiver",  "MIS": "Mais",          "CZH": "Colza hiver",
-    "ORH": "Orge hiver",        "ORP": "Orge printemps","JAC": "Jachere",
-    "PPH": "Prairie permanente","BTA": "Ble tendre autre",
-    "BTN": "Ble tendre printemps","BOR": "Ble orge",
-    "FVL": "Feverole",          "LEC": "Lentille",      "BFS": "Betterave",
+STRESS_TYPES = {
+    "Hydrique 💧" : "HYDRIQUE",
+    "Azoté 🌿"    : "AZOTE",
+    "Ravageurs 🐛": "RAVAGEURS",
 }
 
-FEATURE_COLS = [
-    "ndwi_mean", "ndwi_p10", "ndwi_std", "ndvi_mean",
-    "ndwi_deviation", "ndvi_deviation",
-    "ndwi_delta", "ndvi_delta",
-    "day_of_year",
-    "precip_14d", "tmax_7d", "deficit_7d",
-]
-
-# ── Session state ────────────────────────────────────────────────────────────
+# ── Session state ─────────────────────────────────────────────────────────────
 for key, default in [
     ("tif_path", None), ("date_acq", None), ("meteo_df", None),
-    ("df_features", None), ("df_results", None),
-    ("intra_pid", None),       # parcelle affichée en intra (indépendant du tableau)
-    ("intra_closed", False),   # flag pour ignorer la sélection tableau après fermeture
+    ("bands_cache", None), ("transform_cache", None),
+    # Résultats par stress_type → dict {stress_type: df_results}
+    ("results_by_stress", {}),
+    ("intra_pid", None),
+    ("intra_closed", False),
+    ("intra_stress", None),
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
 
-if "today" not in st.session_state:
+if "today"      not in st.session_state:
     st.session_state["today"] = date.today()
 if "map_center" not in st.session_state:
     st.session_state["map_center"] = [48.69, 2.62]
-if "parcelles" not in st.session_state:
+if "parcelles"  not in st.session_state:
     st.session_state["parcelles"] = {}
 
 
-# ── Helpers ──────────────────────────────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def sev_color(sev):
     return {"critical": "#d9534f", "warning": "#f0ad4e",
@@ -95,236 +82,374 @@ def global_bbox(parcelles):
 
 
 def bbox_hash(minx, miny, maxx, maxy) -> str:
-    """Hash court de la bbox pour nommer les TIF de façon unique par zone."""
     key = f"{minx:.5f}_{miny:.5f}_{maxx:.5f}_{maxy:.5f}"
     return hashlib.md5(key.encode()).hexdigest()[:8]
 
 
 def scene_path(bbox_h: str, acq_date: date) -> Path:
-    """Chemin du TIF : sentinel2_<bbox_hash>_<YYYYMMDD>.tif"""
     SCENES_DIR.mkdir(parents=True, exist_ok=True)
     return SCENES_DIR / f"sentinel2_{bbox_h}_{acq_date.strftime('%Y%m%d')}.tif"
 
 
-def zonal_stats_parcel(geom, index_arr, transform, min_pixels=2):
-    mask   = rasterio.features.geometry_mask(
-        [mapping(geom)], out_shape=index_arr.shape,
-        transform=transform, invert=True,
-    )
-    pixels = index_arr[mask]
-    pixels = pixels[~np.isnan(pixels)]
-    pixels = pixels[(pixels >= -1.0) & (pixels <= 1.0)]
-    if len(pixels) < min_pixels:
-        return None
-    return {
-        "mean": float(np.mean(pixels)), "std":  float(np.std(pixels)),
-        "p10":  float(np.percentile(pixels, 10)),
-        "p90":  float(np.percentile(pixels, 90)),
-        "n":    len(pixels),
-    }
-
-
-def compute_meteo_features(meteo_df, ref_date):
+def compute_meteo_features(meteo_df, ref_date) -> dict:
     mi  = meteo_df.set_index("date")
     ref = pd.Timestamp(ref_date)
-    def agg(days, col, fn="sum"):
-        w = mi.loc[ref - pd.Timedelta(days=days): ref - pd.Timedelta(days=1), col]
+
+    def agg(days_start, days_end, col, fn="sum"):
+        w = mi.loc[ref - pd.Timedelta(days=days_end):
+                   ref - pd.Timedelta(days=days_start), col]
         return float(getattr(w, fn)()) if len(w) else np.nan
+
+    precip_7d  = agg(1, 7,  "precipitation_sum",          "sum")
+    precip_14d = agg(1, 14, "precipitation_sum",          "sum")
+    precip_30d = agg(1, 30, "precipitation_sum",          "sum")
+    et0_7d     = agg(1, 7,  "et0_fao_evapotranspiration", "sum")
+    tmax_7d    = agg(1, 7,  "temperature_2m_max",         "mean")
+    tmin_7d    = agg(1, 7,  "temperature_2m_min",         "mean")
+
+    tmax_vals = mi.loc[ref - pd.Timedelta(days=30):
+                       ref - pd.Timedelta(days=1), "temperature_2m_max"]
+    temp_sum_30d = float(tmax_vals.clip(lower=0).sum()) if len(tmax_vals) else np.nan
+
+    precip_15_30 = agg(15, 30, "precipitation_sum", "sum")
+    precip_delta = (precip_14d - precip_15_30
+                    if not (np.isnan(precip_14d) or np.isnan(precip_15_30))
+                    else np.nan)
+    amp_7d = (tmax_7d - tmin_7d
+              if not (np.isnan(tmax_7d) or np.isnan(tmin_7d)) else np.nan)
+    hum_proxy = (precip_7d / (et0_7d + 0.01)
+                 if not (np.isnan(precip_7d) or np.isnan(et0_7d)) else np.nan)
+
     return {
-        "precip_7d"  : agg(7,  "precipitation_sum",          "sum"),
-        "precip_14d" : agg(14, "precipitation_sum",          "sum"),
-        "tmax_7d"    : agg(7,  "temperature_2m_max",         "mean"),
-        "et0_7d"     : agg(7,  "et0_fao_evapotranspiration", "sum"),
-        "deficit_7d" : agg(7,  "precipitation_sum",          "sum")
-                     - agg(7,  "et0_fao_evapotranspiration", "sum"),
+        "precip_7d"        : precip_7d,
+        "precip_14d"       : precip_14d,
+        "precip_30d"       : precip_30d,
+        "tmax_7d"          : tmax_7d,
+        "tmin_7d"          : tmin_7d,
+        "et0_7d"           : et0_7d,
+        "deficit_7d"       : (precip_7d - et0_7d
+                               if not (np.isnan(precip_7d) or np.isnan(et0_7d))
+                               else np.nan),
+        "temp_sum_30d"     : temp_sum_30d,
+        "precip_delta"     : precip_delta,
+        "tmax_tmin_amp_7d" : amp_7d,
+        "humidity_proxy_7d": hum_proxy,
     }
 
 
-def get_model(code_cultu, stress_type="HYDRIQUE"):
-    index_path = MODELS_DIR / "models_index.csv"
-    if not index_path.exists():
-        raise FileNotFoundError("models_index.csv manquant.")
-    index = pd.read_csv(index_path)
-    index = index[index["stress_type"] == stress_type]
-    for _, row in index.iterrows():
-        if code_cultu in str(row["cultures_codes"]).split(","):
-            data = joblib.load(MODELS_DIR / row["filename"])
-            data.update({"model_name": row["model_name"], "source": "specific"})
-            return data
-    general = index[index["cultures_codes"] == "ALL"]
-    if not general.empty:
-        data = joblib.load(MODELS_DIR / general.iloc[0]["filename"])
-        data["source"] = "fallback"
-        return data
-    raise FileNotFoundError(f"Aucun modèle {stress_type} pour {code_cultu}")
-
-
-def score_row(row, feature_cols):
-    try:
-        model_data = get_model(row["code_cultu"])
-    except FileNotFoundError as e:
-        st.warning(f"⚠️  {row['parcelle_id']} : {e}")
-        return np.nan, False, "unknown", "N/A"
-    model   = model_data["model"]
-    scaler  = model_data["scaler"]
-    feats   = model_data.get("features", feature_cols)
-    X       = row[feats].values.reshape(1, -1)
-    X       = np.nan_to_num(X, nan=0.0)
-    X_sc    = scaler.transform(X)
-    score   = float(model.decision_function(X_sc)[0])
-    is_anom = bool(model.predict(X_sc)[0] == -1)
-    sev     = "critical" if score < -0.12 else "warning" if score < -0.04 else "normal"
-    return score, is_anom, sev, model_data.get("model_name", "general")
-
-
-def build_grid(geom, n):
-    """Grille NxN intersectée avec la géométrie réelle de la parcelle."""
-    minx, miny, maxx, maxy = geom.bounds
-    dx, dy = (maxx - minx) / n, (maxy - miny) / n
-    cells  = []
-    for r in range(n):
-        for c in range(n):
-            cell_box  = sbox(minx+c*dx, miny+r*dy, minx+(c+1)*dx, miny+(r+1)*dy)
-            cell_geom = geom.intersection(cell_box)
-            if cell_geom.is_empty:
-                continue
-            area_ha = cell_geom.area * (111_000 ** 2) / 10_000
-            cells.append({
-                "row": r, "col": c, "cell_id": f"R{r}C{c}",
-                "geometry": cell_geom, "area_ha": round(area_ha, 2),
-            })
-    return cells
-
-
-def run_intra_parcellaire(pid, parcelles_session, ndwi_arr, transform):
+def run_inference_stress(parcelles_session: dict, bands: np.ndarray,
+                          transform, meteo_feats: dict,
+                          date_acq, stress_type: str) -> pd.DataFrame:
     """
-    Calcule et affiche l'analyse intra-parcellaire pour une parcelle.
-    Retourne (fig, m_intra, df_cells, eau_stats).
-
-    Correction du bug "moitié basse" :
-    - Les cellules Shapely sont en coordonnées géo (y croît vers le haut).
-    - Le raster rasterio a son origine en haut à gauche (y décroît vers le bas).
-    - On ne stocke PAS en inversant row dans matrix : on stocke directement
-      matrix[row, col] et on inverse uniquement à l'affichage imshow.
+    Lance l'inférence par cellules sur toutes les parcelles
+    pour un type de stress donné.
+    Retourne un DataFrame une ligne par parcelle.
     """
-    meta   = parcelles_session[pid]
-    geom   = meta["geometry"]
-    surf   = meta["surf_parc"]
-    grid_n = 5 if surf >= 15 else 3 if surf >= 5 else 2
+    rows = []
+    progress = st.progress(0, text=f"Analyse {stress_type}...")
+    total = len(parcelles_session)
 
-    cells  = build_grid(geom, grid_n)
-    # matrix[row, col] : row=0 = bas géo, row=grid_n-1 = haut géo
-    matrix = np.full((grid_n, grid_n), np.nan)
-    areas  = np.zeros((grid_n, grid_n))
+    for i, (pid, pmeta) in enumerate(parcelles_session.items()):
+        progress.progress((i + 1) / total,
+                           text=f"{stress_type} — parcelle {i+1}/{total}")
+        result = infer_parcel_by_cells(
+            geom        = pmeta["geometry"],
+            code_cultu  = pmeta["code_cultu"],
+            bands       = bands,
+            transform   = transform,
+            meteo_feats = meteo_feats,
+            acq_date    = date_acq,
+            stress_type = stress_type,
+            models_dir  = MODELS_DIR,
+        )
+        rows.append({
+            "parcelle_id" : pid,
+            "code_cultu"  : pmeta["code_cultu"],
+            "surf_parc"   : pmeta["surf_parc"],
+            "severity"    : result.get("severity", "unknown"),
+            "worst_score" : result.get("worst_score", np.nan),
+            "n_cells"     : result.get("n_cells", 0),
+            "n_critical"  : result.get("n_critical", 0),
+            "n_warning"   : result.get("n_warning", 0),
+            "n_normal"    : result.get("n_normal", 0),
+            "pct_critical": result.get("pct_critical", 0),
+            "pct_warning" : result.get("pct_warning", 0),
+            "model_source": result.get("model_source", "unknown"),
+            "model_name"  : result.get("model_name", "general"),
+            "error"       : result.get("error"),
+            "_cells"      : result.get("cells", []),  # pour intra-parc
+        })
+    progress.empty()
+    return pd.DataFrame(rows)
 
-    for cell in cells:
-        stats = zonal_stats_parcel(cell["geometry"], ndwi_arr, transform)
-        if stats:
-            # Stockage direct sans inversion : on inversera à l'affichage
-            matrix[cell["row"], cell["col"]] = stats["mean"]
-            areas[cell["row"],  cell["col"]] = cell["area_ha"]
 
-    # Heatmap : imshow affiche row=0 en haut → on flippe pour avoir le nord en haut
-    display_matrix = np.flipud(matrix)
+# ── Rendu carte + tableau pour un stress_type ─────────────────────────────────
 
-    fig, ax = plt.subplots(figsize=(5, 5))
-    norm    = mcolors.TwoSlopeNorm(vmin=-0.5, vcenter=-0.15, vmax=0.2)
-    im      = ax.imshow(display_matrix, cmap=plt.cm.RdYlBu, norm=norm, aspect="equal")
-    plt.colorbar(im, ax=ax, label="NDWI", fraction=0.04)
-    for r_disp in range(grid_n):
-        for c in range(grid_n):
-            v = display_matrix[r_disp, c]
-            if not np.isnan(v):
-                icon = "🔴" if v < -0.3 else "🟠" if v < -0.15 else "🟢"
-                ax.text(c, r_disp, f"{icon}\n{v:.2f}", ha="center", va="center",
-                        fontsize=9, color="white" if v < -0.2 else "black",
-                        fontweight="bold")
-    nom = meta.get("nom", pid[:12])
-    ax.set_title(
-        f"{nom} ({meta['code_cultu']})\nNDWI intra-parcellaire — grille {grid_n}×{grid_n}",
-        fontsize=10,
-    )
-    ax.set_xticks(range(grid_n)); ax.set_yticks(range(grid_n))
-    plt.tight_layout()
+def render_stress_tab(stress_type: str, df_res: pd.DataFrame,
+                       parcelles_session: dict, date_acq):
+    """Affiche carte + filtres + tableau + intra-parcellaire pour un stress."""
 
-    # Carte Folium intra
-    centroid = geom.centroid
-    m_intra  = folium.Map(location=[centroid.y, centroid.x],
-                           zoom_start=16, tiles="Esri WorldImagery")
-    folium.GeoJson(
-        geom.__geo_interface__,
-        style_function=lambda _: {
-            "fillColor": "transparent", "color": "white",
-            "weight": 2, "interactive": False,
-        },
-    ).add_to(m_intra)
+    # ── Filtres ───────────────────────────────────────────────────────────────
+    col_f1, col_f2, col_f3 = st.columns([2, 2, 2])
+    with col_f1:
+        cultures = sorted(df_res["code_cultu"].dropna().unique().tolist())
+        sel_cult = st.multiselect("Cultures", options=cultures, default=cultures,
+                                   key=f"filt_cult_{stress_type}")
+    with col_f2:
+        sev_filt = st.selectbox(
+            "Sévérité", ["Toutes", "Attention et critique", "Critique uniquement"],
+            key=f"filt_sev_{stress_type}",
+        )
+    with col_f3:
+        sort_by = st.selectbox(
+            "Trier par", ["Score (pire en premier)", "Surface", "Culture"],
+            key=f"filt_sort_{stress_type}",
+        )
 
-    for cell in cells:
-        val = matrix[cell["row"], cell["col"]]
-        if np.isnan(val):
-            continue
-        color = "#d9534f" if val < -0.3 else "#f0ad4e" if val < -0.15 else \
-                "#ffe066" if val < 0 else "#5cb85c"
-        label = "Critique" if val < -0.3 else "Modéré" if val < -0.15 else \
-                "Léger" if val < 0 else "Normal"
+    df = df_res.copy()
+    if sel_cult:
+        df = df[df["code_cultu"].isin(sel_cult)]
+    if sev_filt == "Attention et critique":
+        df = df[df["severity"].isin(["warning", "critical"])]
+    elif sev_filt == "Critique uniquement":
+        df = df[df["severity"] == "critical"]
+
+    sort_map = {"Score (pire en premier)": ("worst_score", True),
+                "Surface": ("surf_parc", False), "Culture": ("code_cultu", True)}
+    scol, sasc = sort_map[sort_by]
+    df = df.sort_values(scol, ascending=sasc)
+
+    # ── Métriques ─────────────────────────────────────────────────────────────
+    m1, m2, m3, m4 = st.columns(4)
+    n_tot = len(df)
+    m1.metric("Parcelles", n_tot)
+    m2.metric("Critique",  int((df["severity"] == "critical").sum()))
+    m3.metric("Attention", int((df["severity"] == "warning").sum()))
+    m4.metric("Normal",    int((df["severity"] == "normal").sum()))
+
+    st.divider()
+    col_map, col_tbl = st.columns([3, 2])
+    filtered_ids = set(df["parcelle_id"].astype(str).tolist())
+    res_by_id    = df_res.set_index("parcelle_id").to_dict("index")
+
+    with col_map:
+        date_str = date_acq.strftime("%d %B %Y") if date_acq else "N/A"
+        m = folium.Map(location=st.session_state["map_center"], zoom_start=14)
+        m.get_root().html.add_child(folium.Element(
+            f"<div style='position:fixed;top:10px;left:50%;transform:translateX(-50%);"
+            f"background:rgba(0,0,0,0.75);color:white;padding:8px 14px;"
+            f"border-radius:6px;font-size:13px;z-index:9999;font-family:monospace;'>"
+            f"Parcelle Watch — {stress_type} — {date_str}</div>"
+        ))
+        m.get_root().html.add_child(folium.Element(
+            "<div style='position:fixed;bottom:20px;right:20px;"
+            "background:rgba(0,0,0,0.8);color:white;padding:10px 14px;"
+            "border-radius:6px;font-size:11px;z-index:9999;font-family:monospace;'>"
+            "<b>Sévérité</b><br>"
+            "<span style='color:#d9534f'>■</span> Critique<br>"
+            "<span style='color:#f0ad4e'>■</span> Attention<br>"
+            "<span style='color:#5cb85c'>■</span> Normal<br>"
+            "<span style='color:#cccccc'>■</span> Filtré</div>"
+        ))
+
+        for pid, pmeta in parcelles_session.items():
+            r         = res_by_id.get(pid, {})
+            in_filter = pid in filtered_ids
+            sev       = r.get("severity", "unknown") if in_filter else "filtered"
+            color     = sev_color(sev) if in_filter else "#cccccc"
+            opacity   = 0.65 if in_filter else 0.2
+
+            popup_html = (
+                f"<div style='font-family:monospace;font-size:12px;min-width:180px'>"
+                f"<b>{pid[:12]}</b><br>"
+                f"Culture : <b>{pmeta['code_cultu']}</b><br>"
+                f"Surface : {pmeta['surf_parc']:.1f} ha<br>"
+                f"<hr style='margin:3px 0'>"
+                f"Sévérité : <b style='color:{color}'>{sev.upper()}</b><br>"
+                f"Cellules critiques : {r.get('n_critical',0)} "
+                f"({r.get('pct_critical',0):.0f}% surface)<br>"
+                f"Modèle : {r.get('model_source','?')}"
+                f"</div>"
+            )
+            folium.GeoJson(
+                pmeta["geometry"].__geo_interface__,
+                style_function=lambda _, c=color, o=opacity: {
+                    "fillColor": c, "color": "white",
+                    "weight": 1.5, "fillOpacity": o,
+                },
+                tooltip=folium.Tooltip(f"{pmeta['code_cultu']} — {sev.upper()}"),
+                popup=folium.Popup(popup_html, max_width=220),
+            ).add_to(m)
+
+        st_folium(m, width=None, height=480, key=f"map_{stress_type}")
+
+    with col_tbl:
+        st.subheader("Tableau")
+        df_disp = df[[
+            "parcelle_id", "code_cultu", "surf_parc",
+            "severity", "worst_score", "n_cells",
+            "pct_critical", "pct_warning",
+        ]].rename(columns={
+            "parcelle_id" : "Parcelle",
+            "code_cultu"  : "Culture",
+            "surf_parc"   : "Ha",
+            "severity"    : "Sévérité",
+            "worst_score" : "Score",
+            "n_cells"     : "Cellules",
+            "pct_critical": "% Crit.",
+            "pct_warning" : "% Warn.",
+        }).copy()
+        df_disp["Parcelle"] = df_disp["Parcelle"].str[:12]
+        df_disp["Score"]    = df_disp["Score"].round(3)
+        df_disp["% Crit."] = df_disp["% Crit."].round(1)
+        df_disp["% Warn."] = df_disp["% Warn."].round(1)
+
+        if df_disp.empty:
+            st.info("Aucune parcelle pour ces filtres.")
+        else:
+            event = st.dataframe(
+                df_disp, use_container_width=True, height=380,
+                hide_index=True, on_select="rerun",
+                selection_mode="single-row",
+                key=f"tbl_{stress_type}",
+            )
+            sel_rows = (event.selection.get("rows", [])
+                        if event and event.selection else [])
+
+            if sel_rows and not st.session_state.get("intra_closed", False):
+                full_pid = df.iloc[sel_rows[0]]["parcelle_id"]
+                if (full_pid != st.session_state["intra_pid"]
+                        or st.session_state["intra_stress"] != stress_type):
+                    st.session_state["intra_pid"]    = full_pid
+                    st.session_state["intra_stress"] = stress_type
+                    st.rerun()
+            if st.session_state.get("intra_closed", False):
+                st.session_state["intra_closed"] = False
+
+            if st.session_state["intra_pid"] is not None:
+                st.caption(
+                    f"↓ Analyse : `{str(st.session_state['intra_pid'])[:12]}`"
+                )
+
+    # ── Intra-parcellaire ─────────────────────────────────────────────────────
+    intra_pid = st.session_state.get("intra_pid")
+    # N'afficher que si l'intra appartient à ce stress_type
+    if (intra_pid is not None
+            and st.session_state.get("intra_stress") == stress_type):
+        _render_intra(intra_pid, df_res, parcelles_session, stress_type)
+
+
+def _render_intra(pid: str, df_res: pd.DataFrame,
+                   parcelles_session: dict, stress_type: str):
+    """Affiche l'analyse intra-parcellaire sous le tableau."""
+    st.divider()
+
+    row = df_res[df_res["parcelle_id"] == pid]
+    if row.empty:
+        st.warning("Résultats introuvables pour cette parcelle.")
+        return
+
+    cells      = row.iloc[0]["_cells"]
+    pmeta      = parcelles_session[pid]
+    nom        = pmeta.get("nom", pid[:12])
+    surf       = pmeta["surf_parc"]
+    n_cells    = len(cells)
+
+    col_title, col_close = st.columns([5, 1])
+    with col_title:
+        st.subheader(
+            f"Intra-parcellaire — {nom} ({pmeta['code_cultu']}) "
+            f"— {stress_type} — {n_cells} cellules"
+        )
+    with col_close:
+        if st.button("✕ Fermer", key=f"close_intra_{stress_type}"):
+            st.session_state["intra_pid"]    = None
+            st.session_state["intra_stress"] = None
+            st.session_state["intra_closed"] = True
+            st.rerun()
+
+    if not cells:
+        st.warning("Aucune cellule valide pour cette parcelle.")
+        return
+
+    col_carte, col_stats = st.columns([2, 1])
+
+    with col_carte:
+        geom     = pmeta["geometry"]
+        centroid = geom.centroid
+        m_intra  = folium.Map(location=[centroid.y, centroid.x],
+                               zoom_start=16, tiles="Esri WorldImagery")
         folium.GeoJson(
-            cell["geometry"].__geo_interface__,
-            style_function=lambda _, c2=color: {
-                "fillColor": c2, "color": "white",
-                "weight": 1, "fillOpacity": 0.65, "interactive": False,
+            geom.__geo_interface__,
+            style_function=lambda _: {
+                "fillColor": "transparent", "color": "white",
+                "weight": 2, "interactive": False,
             },
-            tooltip=folium.Tooltip(
-                f"{cell['cell_id']} | NDWI:{val:.3f} | {label} | {cell['area_ha']:.2f} ha"
-            ),
-            popup=folium.Popup(
-                f"<b>{cell['cell_id']}</b><br>NDWI : {val:.3f}<br>"
-                f"{'Irrigation recommandée' if val < -0.15 else 'OK'}",
-                max_width=160,
-            ),
         ).add_to(m_intra)
 
-    # Économie d'eau
-    stress_ha    = sum(cell["area_ha"] for cell in cells
-                       if not np.isnan(matrix[cell["row"], cell["col"]])
-                       and matrix[cell["row"], cell["col"]] < -0.15)
-    total_ha     = sum(c["area_ha"] for c in cells)
-    apport_mm    = 30
-    eau_uniforme = total_ha  * apport_mm * 10
-    eau_ciblee   = stress_ha * apport_mm * 10
-    economie     = eau_uniforme - eau_ciblee
-    pct          = economie / eau_uniforme * 100 if eau_uniforme > 0 else 0
+        for cell in cells:
+            color = sev_color(cell["severity"])
+            folium.GeoJson(
+                cell["geometry"].__geo_interface__,
+                style_function=lambda _, c=color: {
+                    "fillColor": c, "color": "white",
+                    "weight": 1, "fillOpacity": 0.65, "interactive": False,
+                },
+                tooltip=folium.Tooltip(
+                    f"{cell['cell_id']} | Score:{cell['score']:.3f} "
+                    f"| {cell['severity'].upper()} | {cell['area_ha']:.2f} ha"
+                ),
+            ).add_to(m_intra)
 
-    eau_stats = {
-        "stress_ha": stress_ha, "total_ha": total_ha,
-        "eau_uniforme": eau_uniforme, "eau_ciblee": eau_ciblee,
-        "economie": economie, "pct": pct, "apport_mm": apport_mm,
-    }
+        st_folium(m_intra, width=None, height=380,
+                   key=f"map_intra_{pid}_{stress_type}")
 
-    # DataFrame cellules
-    df_cells = pd.DataFrame([{
-        "Cellule"    : cell["cell_id"],
-        "NDWI"       : round(matrix[cell["row"], cell["col"]], 3)
-                       if not np.isnan(matrix[cell["row"], cell["col"]]) else None,
-        "Surface ha" : cell["area_ha"],
-        "Statut"     : ("Critique" if not np.isnan(matrix[cell["row"], cell["col"]])
-                                   and matrix[cell["row"], cell["col"]] < -0.3
-                        else "Modéré" if not np.isnan(matrix[cell["row"], cell["col"]])
-                                     and matrix[cell["row"], cell["col"]] < -0.15
-                        else "Normal"),
-    } for cell in cells])
+    with col_stats:
+        st.markdown("**Répartition des cellules**")
+        df_cells = pd.DataFrame([{
+            "Cellule"  : c["cell_id"],
+            "Score"    : round(c["score"], 3),
+            "Sévérité" : c["severity"],
+            "Surface ha": c["area_ha"],
+        } for c in cells]).sort_values("Score")
 
-    return fig, m_intra, df_cells, eau_stats
+        st.dataframe(df_cells, use_container_width=True,
+                      hide_index=True, height=250)
+
+        total_area   = sum(c["area_ha"] for c in cells)
+        stress_area  = sum(c["area_ha"] for c in cells
+                           if c["severity"] in ("warning", "critical"))
+        pct_stress   = stress_area / total_area * 100 if total_area else 0
+
+        st.divider()
+        st.metric("Surface totale",     f"{total_area:.1f} ha")
+        st.metric("Surface en stress",  f"{stress_area:.1f} ha ({pct_stress:.0f}%)")
+
+        # Économie d'eau (stress hydrique uniquement)
+        if stress_type == "HYDRIQUE":
+            apport_mm    = 30
+            eau_uniforme = total_area  * apport_mm * 10
+            eau_ciblee   = stress_area * apport_mm * 10
+            economie     = eau_uniforme - eau_ciblee
+            pct_eco      = economie / eau_uniforme * 100 if eau_uniforme > 0 else 0
+            st.divider()
+            st.markdown("**Économie d'eau estimée**")
+            st.caption(f"Hypothèse : {apport_mm} mm/ha")
+            st.metric("Irrigation uniforme", f"{eau_uniforme:.0f} m³")
+            st.metric("Irrigation ciblée",   f"{eau_ciblee:.0f} m³")
+            st.metric("Économie potentielle", f"{economie:.0f} m³",
+                       delta=f"{pct_eco:.0f}%",
+                       delta_color="normal" if economie >= 0 else "inverse")
 
 
 # ════════════════════════════════════════════════════════════════════════════
 # PAGE PRINCIPALE
 # ════════════════════════════════════════════════════════════════════════════
-st.title("Alertes stress hydrique")
+st.title("Alertes")
 
 parcelles_session = st.session_state.get("parcelles", {})
-
 if not parcelles_session:
-    st.warning("Aucune parcelle sélectionnée — revenez à la page 'Mes Parcelles'.")
+    st.warning("Aucune parcelle sélectionnée — revenez à 'Mes Parcelles'.")
     st.stop()
 
 # ── Sidebar : nettoyage TIF ──────────────────────────────────────────────────
@@ -332,7 +457,6 @@ with st.sidebar:
     st.subheader("Gestion des données")
     tif_files = list(SCENES_DIR.glob("sentinel2_*.tif")) if SCENES_DIR.exists() else []
     total_mb  = sum(f.stat().st_size for f in tif_files) / 1_048_576
-
     if tif_files:
         st.caption(f"{len(tif_files)} image(s) — {total_mb:.1f} Mo")
         if st.button("🗑️ Supprimer toutes les images", use_container_width=True):
@@ -343,357 +467,120 @@ with st.sidebar:
     else:
         st.caption("Aucune image en cache")
 
-# ── Étape 1 : Scène satellite ────────────────────────────────────────────────
+# ── Acquisition satellite + météo (commune à tous les stress) ────────────────
 minx, miny, maxx, maxy = global_bbox(parcelles_session)
 sh_bbox = BBox(bbox=[minx, miny, maxx, maxy], crs=CRS.WGS84)
 bbox_h  = bbox_hash(minx, miny, maxx, maxy)
 
+############ AJOUT
 st.markdown(f"Bbox : `{minx:.4f},{miny:.4f} → {maxx:.4f},{maxy:.4f}` (hash: `{bbox_h}`)")
+############# / AJOUT
 
 if (minx - maxx) ** 2 > BBOX_LIMIT or (miny - maxy) ** 2 > BBOX_LIMIT:
-    st.warning("Les parcelles sélectionnées sont trop éloignées pour une seule image satellite.")
+    st.warning("Parcelles trop éloignées pour une seule image satellite.")
     st.stop()
 
-config  = get_sh_config()
-end_d   = st.session_state["today"]
-start_d = end_d - timedelta(days=30)
+with st.expander("📡 Acquisition satellite & météo", expanded=False):
+    config  = get_sh_config()
+    end_d   = st.session_state["today"]
+    start_d = end_d - timedelta(days=30)
 
-lat_c = (miny + maxy) / 2
-lon_c = (minx + maxx) / 2
-st.markdown(f'latitude central {lat_c}, et longitude centrale {lon_c}')
-st.session_state['map_center'] = [lat_c, lon_c]
+    with st.spinner("Recherche scènes..."):
+        scenes = search_available_scenes(sh_bbox, start_d, end_d,
+                                         max_cloud_coverage=0.30, config=config)
+    if not scenes:
+        st.warning("Aucune scène disponible.")
+        st.stop()
 
-with st.spinner(f"Recherche scènes du {start_d} au {end_d}..."):
-    scenes = search_available_scenes(sh_bbox, start_d, end_d,
-                                     max_cloud_coverage=0.30, config=config)
+    latest   = scenes[-1]
+    date_acq = latest["date"]
+    st.session_state["date_acq"] = date_acq
+    st.markdown(f"Scène : **{date_acq}** — nuages : {latest['cloud_coverage']:.1f}%")
 
-if not scenes:
-    st.warning("⚠️  Aucune scène disponible — couverture nuageuse trop importante.")
-    st.stop()
-
-latest   = scenes[-1]
-date_acq = latest["date"]
-st.session_state["date_acq"] = date_acq
-st.markdown(f"Scène retenue : **{date_acq}** (nuages : {latest['cloud_coverage']:.1f}%)")
-
-# Nom du TIF inclut le hash bbox → deux zones différentes = deux fichiers distincts
-tif_path = scene_path(bbox_h, date_acq)
-
-if tif_path.exists():
-    st.info(f"Image déjà en cache : `{tif_path.name}`")
-else:
-    with st.spinner("Téléchargement de la scène..."):
-        tif_path = download_scene(
-            bbox=sh_bbox, acquisition_date=date_acq,
-            output_dir=SCENES_DIR, config=config,
-        )
-        # Renommer selon la convention bbox_hash si download_scene génère un autre nom
-        expected = scene_path(bbox_h, date_acq)
-        if tif_path != expected:
-            tif_path.rename(expected)
-            tif_path = expected
-
-st.session_state["tif_path"] = tif_path
-st.success(f"TIF : `{tif_path.name}`")
-
-# ── Étape 2 : Météo ──────────────────────────────────────────────────────────
-lat_c       = (miny + maxy) / 2
-lon_c       = (minx + maxx) / 2
-meteo_start = date_acq - timedelta(days=14)
-
-with st.spinner("Récupération météo..."):
-    meteo_df = fetch_historical_weather(lat_c, lon_c, meteo_start, date_acq)
-meteo_df["date"] = pd.to_datetime(meteo_df["date"])
-st.session_state["meteo_df"] = meteo_df
-st.success(f"Météo : {len(meteo_df)} jours ({meteo_start} → {date_acq})")
-
-# ── Étape 3 : Features + inférence ──────────────────────────────────────────
-bands, meta = load_bands(tif_path)
-ndvi_arr    = compute_ndvi(bands)
-ndwi_arr    = compute_ndwi(bands)
-transform   = meta["transform"]
-meteo_feat  = compute_meteo_features(meteo_df, date_acq)
-
-rows = []
-for pid, pmeta in parcelles_session.items():
-    geom   = pmeta["geometry"]
-    s_ndvi = zonal_stats_parcel(geom, ndvi_arr, transform)
-    s_ndwi = zonal_stats_parcel(geom, ndwi_arr, transform)
-    if s_ndvi is None or s_ndwi is None:
-        st.warning(f"⚠️  Parcelle {pid[:12]} : trop peu de pixels valides")
-        continue
-    row = {
-        "parcelle_id": pid,
-        "source"     : pmeta["source"],
-        "code_cultu" : pmeta["code_cultu"],
-        "surf_parc"  : pmeta["surf_parc"],
-        "date"       : date_acq,
-        "ndvi_mean"  : s_ndvi["mean"], "ndvi_std": s_ndvi["std"],
-        "ndvi_p10"   : s_ndvi["p10"],  "ndvi_p90": s_ndvi["p90"],
-        "ndwi_mean"  : s_ndwi["mean"], "ndwi_std": s_ndwi["std"],
-        "ndwi_p10"   : s_ndwi["p10"],  "ndwi_p90": s_ndwi["p90"],
-        "n_pixels"   : s_ndvi["n"],
-        "day_of_year": date_acq.timetuple().tm_yday,
-        "ndwi_delta" : np.nan, "ndvi_delta"    : np.nan,
-        "ndwi_deviation": 0.0, "ndvi_deviation": 0.0,
-    }
-    row.update(meteo_feat)
-    rows.append(row)
-
-if not rows:
-    st.error("Aucune parcelle n'a pu être analysée.")
-    st.stop()
-
-df_feat = pd.DataFrame(rows)
-st.session_state["df_features"] = df_feat
-
-results = []
-for _, row in df_feat.iterrows():
-    score, is_anom, sev, model_name = score_row(row, FEATURE_COLS)
-    results.append({
-        "parcelle_id"  : row["parcelle_id"],
-        "code_cultu"   : row["code_cultu"],
-        "surf_parc"    : row["surf_parc"],
-        "ndwi_mean"    : row["ndwi_mean"],
-        "ndvi_mean"    : row["ndvi_mean"],
-        "deficit_7d"   : row["deficit_7d"],
-        "anomaly_score": score,
-        "is_anomaly"   : is_anom,
-        "severity"     : sev,
-        "model_used"   : model_name,
-    })
-
-df_res = pd.DataFrame(results)
-st.session_state["df_results"] = df_res
-st.success("✅ Inférence terminée")
-
-st.divider()
-
-# ════════════════════════════════════════════════════════════════════════════
-# SECTION RÉSULTATS
-# ════════════════════════════════════════════════════════════════════════════
-st.subheader("Résultats")
-
-# ── Filtres ──────────────────────────────────────────────────────────────────
-col_f1, col_f2, col_f3 = st.columns([2, 2, 2])
-with col_f1:
-    cultures_dispo = sorted(df_res["code_cultu"].dropna().unique().tolist())
-    sel_cultures   = st.multiselect(
-        "Cultures", options=cultures_dispo, default=cultures_dispo,
-        key="filter_cultures",
-    )
-with col_f2:
-    sev_filter = st.selectbox(
-        "Sévérité", ["Toutes", "Attention et critique", "Critique uniquement"],
-        key="filter_sev",
-    )
-with col_f3:
-    sort_by = st.selectbox(
-        "Trier par", ["Score (pire en premier)", "Surface", "Culture"],
-        key="filter_sort",
-    )
-
-df_filtered = df_res.copy()
-if sel_cultures:
-    df_filtered = df_filtered[df_filtered["code_cultu"].isin(sel_cultures)]
-if sev_filter == "Attention et critique":
-    df_filtered = df_filtered[df_filtered["severity"].isin(["warning", "critical"])]
-elif sev_filter == "Critique uniquement":
-    df_filtered = df_filtered[df_filtered["severity"] == "critical"]
-
-sort_map = {
-    "Score (pire en premier)": ("anomaly_score", True),
-    "Surface": ("surf_parc", False),
-    "Culture": ("code_cultu", True),
-}
-sort_col, sort_asc = sort_map[sort_by]
-df_filtered = df_filtered.sort_values(sort_col, ascending=sort_asc)
-
-# ── Métriques ─────────────────────────────────────────────────────────────────
-m1, m2, m3, m4 = st.columns(4)
-n_tot  = len(df_filtered)
-n_anom = int(df_filtered["is_anomaly"].sum()) if n_tot else 0
-m1.metric("Parcelles", n_tot)
-m2.metric("Anomalies", f"{n_anom} ({n_anom/n_tot*100:.0f}%)" if n_tot else "0")
-m3.metric("Attention",  int((df_filtered["severity"] == "warning").sum()))
-m4.metric("Critique",   int((df_filtered["severity"] == "critical").sum()))
-
-st.divider()
-
-# ── Carte + Tableau ───────────────────────────────────────────────────────────
-col_map, col_tbl = st.columns([3, 2])
-filtered_ids = set(df_filtered["parcelle_id"].astype(str).tolist())
-
-with col_map:
-    date_str = date_acq.strftime("%d %B %Y")
-    m_folium = folium.Map(location=st.session_state["map_center"], zoom_start=14)
-
-    m_folium.get_root().html.add_child(folium.Element(
-        f"<div style='position:fixed;top:10px;left:50%;transform:translateX(-50%);"
-        f"background:rgba(0,0,0,0.75);color:white;padding:8px 14px;"
-        f"border-radius:6px;font-size:13px;z-index:9999;font-family:monospace;'>"
-        f"Parcelle Watch — Stress hydrique — {date_str}</div>"
-    ))
-    m_folium.get_root().html.add_child(folium.Element(
-        "<div style='position:fixed;bottom:20px;right:20px;"
-        "background:rgba(0,0,0,0.8);color:white;padding:10px 14px;"
-        "border-radius:6px;font-size:11px;z-index:9999;font-family:monospace;'>"
-        "<b>Stress hydrique</b><br>"
-        "<span style='color:#d9534f'>■</span> Critique<br>"
-        "<span style='color:#f0ad4e'>■</span> Attention<br>"
-        "<span style='color:#5cb85c'>■</span> Normal<br>"
-        "<span style='color:#cccccc'>■</span> Filtré</div>"
-    ))
-
-    res_by_id = df_res.set_index("parcelle_id").to_dict("index")
-
-    for pid, pmeta in parcelles_session.items():
-        r         = res_by_id.get(pid, {})
-        in_filter = pid in filtered_ids
-        sev       = r.get("severity", "unknown") if in_filter else "filtered"
-        color     = sev_color(sev) if in_filter else "#cccccc"
-        opacity   = 0.65 if in_filter else 0.2
-        ndwi_s    = f"{r.get('ndwi_mean', 0):.3f}" if r else "N/A"
-        score_s   = f"{r.get('anomaly_score', 0):.3f}" if r else "N/A"
-
-        popup_html = (
-            f"<div style='font-family:monospace;font-size:12px;min-width:170px'>"
-            f"<b>{pid[:12]}</b><br>"
-            f"Culture : <b>{pmeta['code_cultu']}</b><br>"
-            f"Surface : {pmeta['surf_parc']:.1f} ha<br>"
-            f"<hr style='margin:3px 0'>"
-            f"NDWI : {ndwi_s}<br>Score : {score_s}<br>"
-            f"Sévérité : <b style='color:{color}'>{sev.upper()}</b>"
-            f"{'<br><i>(filtré)</i>' if not in_filter else ''}"
-            f"</div>"
-        )
-        folium.GeoJson(
-            pmeta["geometry"].__geo_interface__,
-            style_function=lambda _, c=color, o=opacity: {
-                "fillColor": c, "color": "white", "weight": 1.5, "fillOpacity": o,
-            },
-            tooltip=folium.Tooltip(f"{pmeta['code_cultu']} — {sev.upper()}"),
-            popup=folium.Popup(popup_html, max_width=200),
-        ).add_to(m_folium)
-
-    st_folium(m_folium, width=None, height=500, key="map_res")
-
-with col_tbl:
-    st.subheader("Tableau des alertes")
-
-    df_display = df_filtered[[
-        "parcelle_id", "code_cultu", "surf_parc",
-        "ndwi_mean", "anomaly_score", "severity",
-    ]].rename(columns={
-        "parcelle_id"  : "Parcelle",
-        "code_cultu"   : "Culture",
-        "surf_parc"    : "Ha",
-        "ndwi_mean"    : "NDWI",
-        "anomaly_score": "Score",
-        "severity"     : "Sévérité",
-    }).copy()
-    for c in ["NDWI", "Score"]:
-        if c in df_display.columns:
-            df_display[c] = df_display[c].round(3)
-    df_display["Parcelle"] = df_display["Parcelle"].str[:12]
-
-    if df_display.empty:
-        st.info("Aucune parcelle pour ces filtres.")
+    tif_path = scene_path(bbox_h, date_acq)
+    if tif_path.exists():
+        st.info(f"Cache : `{tif_path.name}`")
     else:
-        event = st.dataframe(
-            df_display,
-            use_container_width=True,
-            height=380,
-            hide_index=True,
-            on_select="rerun",
-            selection_mode="single-row",
-            key="tbl_alertes",
+        with st.spinner("Téléchargement..."):
+            tif_path = download_scene(
+                bbox=sh_bbox, acquisition_date=date_acq,
+                output_dir=SCENES_DIR, config=config,
+            )
+            expected = scene_path(bbox_h, date_acq)
+            if tif_path != expected:
+                tif_path.rename(expected)
+                tif_path = expected
+    st.session_state["tif_path"] = tif_path
+
+    lat_c = (miny + maxy) / 2
+    lon_c = (minx + maxx) / 2
+    with st.spinner("Météo..."):
+        meteo_df = fetch_historical_weather(
+            lat_c, lon_c,
+            date_acq - timedelta(days=30), date_acq,
         )
+    meteo_df["date"] = pd.to_datetime(meteo_df["date"])
+    st.session_state["meteo_df"] = meteo_df
+    st.success(f"✅ Prêt — {date_acq}")
 
-        selected_rows = (event.selection.get("rows", [])
-                         if event and event.selection else [])
+# Vérification que l'acquisition est faite
+if st.session_state["tif_path"] is None:
+    st.info("Ouvrez 'Acquisition satellite & météo' ci-dessus pour lancer l'analyse.")
+    st.stop()
 
-        # Si une ligne est sélectionnée ET qu'on n'est pas en mode "fermé",
-        # on met à jour intra_pid.
-        if selected_rows and not st.session_state.get("intra_closed", False):
-            row_idx  = selected_rows[0]
-            full_pid = df_filtered.iloc[row_idx]["parcelle_id"]
-            if full_pid != st.session_state["intra_pid"]:
-                st.session_state["intra_pid"] = full_pid
-                st.rerun()
-        # Réinitialiser le flag après lecture
-        if st.session_state.get("intra_closed", False):
-            st.session_state["intra_closed"] = False
+# Chargement bandes (une seule fois, mis en cache session)
+if st.session_state["bands_cache"] is None:
+    bands, meta = load_bands(st.session_state["tif_path"])
+    st.session_state["bands_cache"]     = bands
+    st.session_state["transform_cache"] = meta["transform"]
 
-        if st.session_state["intra_pid"] is not None:
-            st.caption(
-                f"↓ Analyse : `{str(st.session_state['intra_pid'])[:12]}`"
+bands     = st.session_state["bands_cache"]
+transform = st.session_state["transform_cache"]
+meteo_feats = compute_meteo_features(
+    st.session_state["meteo_df"],
+    st.session_state["date_acq"],
+)
+date_acq = st.session_state["date_acq"]
+
+# ── Onglets par type de stress ────────────────────────────────────────────────
+tab_hydrique, tab_azote, tab_ravageurs = st.tabs(list(STRESS_TYPES.keys()))
+
+for tab, (tab_label, stress_type) in zip(
+    [tab_hydrique, tab_azote, tab_ravageurs], STRESS_TYPES.items()
+):
+    with tab:
+        results_cache = st.session_state["results_by_stress"]
+
+        # Bouton pour lancer/relancer l'analyse de ce stress
+        col_btn, col_info = st.columns([2, 4])
+        with col_btn:
+            run_label = ("🔄 Relancer" if stress_type in results_cache
+                         else "▶ Lancer l'analyse")
+            do_run = st.button(run_label, key=f"run_{stress_type}",
+                                type="primary")
+        with col_info:
+            if stress_type in results_cache:
+                st.caption(f"Résultats disponibles — {date_acq}")
+
+        if do_run:
+            df_res = run_inference_stress(
+                parcelles_session, bands, transform,
+                meteo_feats, date_acq, stress_type,
             )
-
-st.divider()
-
-# ════════════════════════════════════════════════════════════════════════════
-# SECTION INTRA-PARCELLAIRE
-# ════════════════════════════════════════════════════════════════════════════
-intra_pid = st.session_state.get("intra_pid")
-
-if intra_pid is None:
-    st.info("👆 Cliquez sur une ligne du tableau pour afficher l'analyse intra-parcellaire.")
-else:
-    pmeta = parcelles_session.get(intra_pid)
-    if pmeta is None:
-        st.warning("Parcelle introuvable en session.")
-    else:
-        nom    = pmeta.get("nom", intra_pid[:12])
-        surf   = pmeta["surf_parc"]
-        grid_n = 5 if surf >= 15 else 3 if surf >= 5 else 2
-
-        col_title, col_close = st.columns([5, 1])
-        with col_title:
-            st.subheader(
-                f"Intra-parcellaire — {nom} ({pmeta['code_cultu']}) — grille {grid_n}×{grid_n}"
-            )
-        with col_close:
-            # Bouton fermer : réinitialise intra_pid + pose le flag pour ignorer
-            # la sélection résiduelle du tableau au prochain rerun
-            if st.button("✕ Fermer", key="btn_close_intra"):
+            results_cache[stress_type] = df_res
+            st.session_state["results_by_stress"] = results_cache
+            # Réinitialiser l'intra si on relance
+            if st.session_state.get("intra_stress") == stress_type:
                 st.session_state["intra_pid"]    = None
-                st.session_state["intra_closed"] = True
-                st.rerun()
+                st.session_state["intra_stress"] = None
+            st.rerun()
 
-        col_heat, col_carte_intra = st.columns([1, 2])
-
-        with st.spinner("Calcul de la grille..."):
-            try:
-                fig, m_intra, df_cells, eau = run_intra_parcellaire(
-                    intra_pid, parcelles_session, ndwi_arr, transform
-                )
-
-                with col_heat:
-                    st.pyplot(fig)
-                    plt.close(fig)
-
-                with col_carte_intra:
-                    st_folium(m_intra, width=None, height=400,
-                               key=f"map_intra_{intra_pid}")
-
-                col_cells, col_eau = st.columns([2, 1])
-                with col_cells:
-                    st.markdown("**Détail par cellule**")
-                    st.dataframe(df_cells, use_container_width=True,
-                                  hide_index=True, height=200)
-
-                with col_eau:
-                    st.markdown("**Économie d'eau estimée**")
-                    st.caption(f"Hypothèse : {eau['apport_mm']} mm/ha")
-                    st.metric("Surface en stress",
-                               f"{eau['stress_ha']:.1f} / {eau['total_ha']:.1f} ha")
-                    st.metric("Irrigation uniforme",  f"{eau['eau_uniforme']:.0f} m³")
-                    st.metric("Irrigation ciblée",    f"{eau['eau_ciblee']:.0f} m³")
-                    st.metric("Économie potentielle",
-                               f"{eau['economie']:.0f} m³",
-                               delta=f"{eau['pct']:.0f}%",
-                               delta_color="normal" if eau["economie"] >= 0 else "inverse")
-
-            except Exception as e:
-                st.error(f"Erreur analyse intra-parcellaire : {e}")
+        if stress_type in results_cache:
+            render_stress_tab(
+                stress_type,
+                results_cache[stress_type],
+                parcelles_session,
+                date_acq,
+            )
+        else:
+            st.info(f"Cliquez sur '▶ Lancer l'analyse' pour analyser le stress {tab_label}.")
